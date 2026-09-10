@@ -1,0 +1,115 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>shadow truth</title>
+<style>html,body{margin:0;background:#000}</style></head>
+<body><canvas id="c" width="320" height="180"></canvas>
+<script type="importmap">{ "imports": { "three": "../vendor/three.module.js" } }</script>
+<script type="module">
+import * as THREE from 'three';
+import { makeFabricTexture, makeAlphaFromDraw } from '../src/textures.js';
+import { Stage } from '../src/stage.js';
+import { Renderer } from '../src/renderer.js';
+import { WaveScreen } from '../src/screen.js';
+import { markShadowCaster } from '../src/materials.js';
+
+const canvas = document.getElementById('c');
+const renderer = new Renderer(canvas, { width: 320, height: 180, pixelRatio: 1 });
+const R = renderer.renderer;
+// 与 probe-screen.html 完全一致：相机在 (0,0.06,5.2) 看原点，屏幕 4x2.5
+renderer.camera.position.set(0, 0.06, 5.2);
+renderer.camera.lookAt(0, 0.02, 0);
+renderer.camera.updateMatrixWorld(true);
+const stage = new Stage({ screenWidth: 4, screenHeight: 2.5, lightFar: 12 });
+renderer.scene.add(stage.group);
+const fabric = makeFabricTexture(256);
+const screen = new WaveScreen({ width: 4, height: 2.5, segX: 48, segY: 32, fabric });
+screen.bindRenderer(renderer);
+renderer.scene.add(screen.mesh);
+screen.attachLight(stage.light, { lightFar: 12, shadowSize: 512 });
+
+const tex = makeAlphaFromDraw((ctx, w, h) => {
+  ctx.beginPath();
+  ctx.moveTo(w * 0.36, h * 0.94); ctx.lineTo(w * 0.42, h * 0.25);
+  ctx.lineTo(w * 0.58, h * 0.25); ctx.lineTo(w * 0.64, h * 0.94); ctx.closePath(); ctx.fill();
+  ctx.beginPath(); ctx.arc(w * 0.5, h * 0.19, w * 0.13, 0, Math.PI * 2); ctx.fill();
+}, { w: 128, h: 192, baseColor: '#1b0d06', glow: 0.5 });
+const mesh = new THREE.Mesh(new THREE.PlaneGeometry(1.05, 1.55),
+  new THREE.MeshBasicMaterial({ map: tex, transparent: true, alphaTest: 0.45, side: THREE.DoubleSide, toneMapped: false }));
+markShadowCaster(mesh, tex, { alphaTest: 0.45, lightFar: 12 });
+mesh.position.set(-0.4, -1.24, -0.15);
+renderer.scene.add(mesh);
+
+const rt = new THREE.WebGLRenderTarget(320, 180, {
+  minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter,
+  format: THREE.RGBAFormat, type: THREE.UnsignedByteType, depthBuffer: true, stencilBuffer: false,
+});
+
+function shoot(label) {
+  R.setRenderTarget(rt);
+  R.setClearColor(0x000000, 1);
+  R.clear(true, true, true);
+  R.render(renderer.scene, renderer.camera);
+  R.setRenderTarget(null);
+  const buf = new Uint8Array(320 * 180 * 4);
+  R.readRenderTargetPixels(rt, 0, 0, 320, 180, buf);
+  const rows = [];
+  for (let gy = 0; gy < 6; gy++) {
+    const r2 = [];
+    for (let gx = 0; gx < 10; gx++) {
+      const x = Math.floor((gx + 0.5) / 10 * 320);
+      const y = Math.floor((gy + 0.5) / 6 * 180);
+      r2.push(String(buf[(y * 320 + x) * 4]).padStart(3));
+    }
+    rows.push(`y${gy}: ` + r2.join(' '));
+  }
+  // 影子预期位置
+  const wp = new THREE.Vector3();
+  mesh.getWorldPosition(wp);
+  const L = stage.light.getWorldPosition(new THREE.Vector3());
+  const t = (0 - L.z) / (wp.z - L.z);
+  const sw = new THREE.Vector3(L.x + (wp.x - L.x) * t, L.y + (wp.y - L.y) * t, 0);
+  const sp = sw.clone().project(renderer.camera);
+  const sx = Math.round((sp.x * 0.5 + 0.5) * 320), sy = Math.round((sp.y * 0.5 + 0.5) * 180);
+  const syF = 180 - 1 - sy;
+  const at = buf.slice((syF * 320 + sx) * 4, (syF * 320 + sx) * 4 + 3);
+  return { label, sx, sy, rows, atShadow: Array.from(at) };
+}
+
+const res = {};
+screen.setDebugMode(0);
+screen.update(1 / 60, stage.light, renderer.camera);
+screen.renderShadow(renderer.scene);
+res.final = shoot('final');
+
+// 逐模式：看 shadow 与采样值
+for (const mode of [1, 9, 8]) {
+  screen.setDebugMode(mode);
+  screen.update(1 / 60, stage.light, renderer.camera);
+  screen.renderShadow(renderer.scene);
+  res['mode' + mode] = shoot('mode' + mode);
+}
+screen.setDebugMode(0);
+
+// 直接读 shadow map 里那几个点
+res.shadowMapSamples = (function () {
+  const lv = screen.uniforms.uLightView.value, lp = screen.uniforms.uLightProjection.value;
+  const rn = screen.uniforms.uRangeNear.value, rf = screen.uniforms.uRangeFar.value;
+  const mrt = screen.shadowStage.map;
+  const out = [];
+  for (const wx of [-0.9, -0.4, 0.1, 0.6, 1.1]) {
+    const wp = new THREE.Vector3(wx, -0.5, 0);
+    const c = new THREE.Vector4(wp.x, wp.y, wp.z, 1).applyMatrix4(lv).applyMatrix4(lp);
+    const u = c.x / c.w * 0.5 + 0.5, v = c.y / c.w * 0.5 + 0.5;
+    if (u < 0 || u > 1 || v < 0 || v > 1) { out.push({ wx, uv: [u.toFixed(3), v.toFixed(3)], val: 'oob' }); continue; }
+    const px = Math.floor(u * mrt.width), py = Math.floor(v * mrt.height);
+    const b = new Uint8Array(4);
+    R.readRenderTargetPixels(mrt, px, py, 1, 1, b);
+    const vd = -(new THREE.Vector4(wp.x, wp.y, wp.z, 1).applyMatrix4(lv)).z;
+    out.push({ wx, uv: [+u.toFixed(3), +v.toFixed(3)], ref: +((vd - rn) / (rf - rn)).toFixed(3), val: b[0] });
+  }
+  return out;
+})();
+
+window.__RES__ = res;
+window.__READY__ = true;
+</script>
+</body></html>

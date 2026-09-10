@@ -1,0 +1,123 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>shadow compare</title>
+<style>html,body{margin:0;background:#000}</style></head>
+<body><canvas id="c" width="320" height="180"></canvas>
+<script type="importmap">{ "imports": { "three": "../vendor/three.module.js" } }</script>
+<script type="module">
+import * as THREE from 'three';
+import { makeFabricTexture, makeAlphaFromDraw } from '../src/textures.js';
+import { Stage } from '../src/stage.js';
+import { Renderer } from '../src/renderer.js';
+import { WaveScreen } from '../src/screen.js';
+import { markShadowCaster } from '../src/materials.js';
+
+const canvas = document.getElementById('c');
+const renderer = new Renderer(canvas, { width: 320, height: 180, pixelRatio: 1 });
+const R = renderer.renderer;
+const stage = new Stage({ screenWidth: 4, screenHeight: 2.5, lightFar: 12 });
+renderer.scene.add(stage.group);
+const fabric = makeFabricTexture(256);
+const screen = new WaveScreen({ width: 4, height: 2.5, segX: 40, segY: 24, fabric });
+screen.bindRenderer(renderer);
+renderer.scene.add(screen.mesh);
+screen.attachLight(stage.light, { lightFar: 12, shadowSize: 512 });
+
+const tex = makeAlphaFromDraw((ctx, w, h) => {
+  ctx.beginPath();
+  ctx.moveTo(w * 0.36, h * 0.94); ctx.lineTo(w * 0.42, h * 0.25);
+  ctx.lineTo(w * 0.58, h * 0.25); ctx.lineTo(w * 0.64, h * 0.94); ctx.closePath(); ctx.fill();
+  ctx.beginPath(); ctx.arc(w * 0.5, h * 0.19, w * 0.13, 0, Math.PI * 2); ctx.fill();
+}, { w: 128, h: 192, baseColor: '#1b0d06', glow: 0.5 });
+const mesh = new THREE.Mesh(new THREE.PlaneGeometry(1.05, 1.55),
+  new THREE.MeshBasicMaterial({ map: tex, transparent: true, alphaTest: 0.45, side: THREE.DoubleSide, toneMapped: false }));
+markShadowCaster(mesh, tex, { alphaTest: 0.45, lightFar: 12 });
+mesh.position.set(-0.4, -1.24, -0.16);
+renderer.scene.add(mesh);
+
+const rt = new THREE.WebGLRenderTarget(320, 180, {
+  minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter,
+  format: THREE.RGBAFormat, type: THREE.UnsignedByteType, depthBuffer: true, stencilBuffer: false,
+});
+
+function row() {
+  R.setRenderTarget(rt);
+  R.setClearColor(0x000000, 1);
+  R.clear(true, true, true);
+  R.render(renderer.scene, renderer.camera);
+  R.setRenderTarget(null);
+  const buf = new Uint8Array(320 * 180 * 4);
+  R.readRenderTargetPixels(rt, 0, 0, 320, 180, buf);
+  const out = [];
+  for (let x = 20; x < 320; x += 20) {
+    const i = (90 * 320 + x) * 4;
+    out.push(buf[i]);
+  }
+  return out;
+}
+
+/** 扫描整幅画面（不只是中间一行），看 shadow map 在屏幕空间里的分布 */
+function grid() {
+  R.setRenderTarget(rt);
+  R.setClearColor(0x000000, 1);
+  R.clear(true, true, true);
+  R.render(renderer.scene, renderer.camera);
+  R.setRenderTarget(null);
+  const buf = new Uint8Array(320 * 180 * 4);
+  R.readRenderTargetPixels(rt, 0, 0, 320, 180, buf);
+  const rows = [];
+  for (let gy = 0; gy < 10; gy++) {
+    const r2 = [];
+    for (let gx = 0; gx < 10; gx++) {
+      const x = Math.floor((gx + 0.5) / 10 * 320);
+      const y = Math.floor((gy + 0.5) / 10 * 180);
+      r2.push(buf[(y * 320 + x) * 4]);
+    }
+    rows.push(r2.join(' '));
+  }
+  return rows;
+}
+
+function frame() {
+  screen.update(1 / 60, stage.light, renderer.camera);
+  screen.renderShadow(renderer.scene);
+}
+
+const res = {};
+for (const mode of [0, 5, 6]) {
+  screen.setDebugMode(mode);
+  frame();
+  res['mode' + mode] = row();
+  res['grid' + mode] = grid();
+}
+
+// 同时输出 ref 与 sd 的具体数值：用 mode 6 (ref) 和 mode 5 (sd) 的 R 通道对照
+res.screenCentreUV = (function () {
+  const v = new THREE.Vector3(0, 0, 0);
+  v.project(renderer.camera);
+  return [v.x, v.y];
+})();
+
+// 把 shadow map 本体画到第二个 canvas，肉眼确认形状与位置
+res.mapStats = screen.shadowStage.readStats(R);
+{
+  const c2 = document.createElement('canvas');
+  c2.width = 512; c2.height = 512;
+  document.body.appendChild(c2);
+  const r2 = new THREE.WebGLRenderer({ canvas: c2, antialias: false, preserveDrawingBuffer: true });
+  r2.setSize(512, 512, false);
+  const quad = new THREE.Mesh(new THREE.PlaneGeometry(2, 2),
+    new THREE.MeshBasicMaterial({ map: screen.shadowStage.map.texture, toneMapped: false }));
+  const s = new THREE.Scene(); s.add(quad);
+  r2.setClearColor(0x000000, 1);
+  r2.render(s, new THREE.OrthographicCamera(-1, 1, 1, -1, 0.1, 10));
+}
+
+window.__RES__ = res;
+window.__SCREEN__ = screen;
+window.__RENDERER__ = renderer;
+window.__SCENE__ = renderer.scene;
+window.__STAGE__ = stage;
+window.__THREE__ = THREE;
+window.__READY__ = true;
+</script>
+</body></html>

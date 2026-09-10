@@ -1,0 +1,121 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>min shadow</title>
+<style>html,body{margin:0;background:#111}canvas{display:block}</style></head>
+<body>
+<canvas id="c" width="256" height="256"></canvas>
+<script type="importmap">{ "imports": { "three": "../vendor/three.module.js" } }</script>
+<script type="module">
+import * as THREE from 'three';
+import { makeAlphaFromDraw } from '../src/textures.js';
+import { markShadowCaster } from '../src/materials.js';
+import { WaveScreen } from '../src/screen.js';
+
+const canvas = document.getElementById('c');
+const renderer = new THREE.WebGLRenderer({ canvas, antialias: false, preserveDrawingBuffer: true });
+renderer.setPixelRatio(1);
+renderer.setSize(256, 256, false);
+renderer.outputColorSpace = THREE.LinearSRGBColorSpace;
+renderer.toneMapping = THREE.NoToneMapping;
+renderer.setClearColor(0xff00ff, 1);
+
+const scene = new THREE.Scene();
+const light = new THREE.SpotLight(0xffffff, 3, 12, 0.8, 0.8, 1);
+light.position.set(0, 0, -3);
+light.target.position.set(0, 0, 0);
+scene.add(light, light.target);
+const cam = new THREE.PerspectiveCamera(50, 1, 0.1, 50);
+cam.position.set(0, 0, 4);
+
+// 一个亮色的投射平面（用 MeshBasicMaterial 的 map+alphaTest，和皮影同构）
+const tex = makeAlphaFromDraw((ctx, w, h) => {
+  ctx.beginPath(); ctx.arc(w / 2, h / 2, w * 0.30, 0, Math.PI * 2); ctx.fill();
+}, { w: 128, h: 128, baseColor: '#1b0d06', glow: 0 });
+const mesh = new THREE.Mesh(new THREE.PlaneGeometry(1.2, 1.2),
+  new THREE.MeshBasicMaterial({ map: tex, transparent: true, alphaTest: 0.45, side: THREE.DoubleSide }));
+markShadowCaster(mesh, tex, { alphaTest: 0.45, lightFar: 12 });
+mesh.position.set(0, 0, -0.6);
+scene.add(mesh);
+
+const shadowStage = new WaveScreen({ width: 4, height: 2.5, segX: 8, segY: 8,
+  fabric: { map: new THREE.Texture(), bumpMap: new THREE.Texture() } }).shadowStage;
+
+// 手动造一个和 ShadowStage 一样的 RT，保证诊断与实现一致
+const rt = new THREE.WebGLRenderTarget(512, 512, {
+  minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter,
+  format: THREE.RGBAFormat, type: THREE.UnsignedByteType, depthBuffer: true, stencilBuffer: false,
+});
+
+// 把灯光相机摆好
+const lc = light.shadow.camera;
+lc.position.copy(light.position);
+lc.lookAt(light.target.position);
+lc.near = 0.5; lc.far = 12;
+lc.updateProjectionMatrix();
+lc.updateMatrixWorld(true);
+
+// 用自定义深度材质渲染
+const mats = mesh.userData.shadowMats;
+for (const m of mats) m.uniforms.uLightView.value.copy(lc.matrixWorldInverse);
+
+const results = {};
+
+// A) 用普通材质渲染到 RT，验证 readback 通路
+{
+  renderer.setRenderTarget(rt);
+  renderer.setClearColor(0x00ff00, 1);
+  renderer.clear(true, true, false);
+  const plain = new THREE.Mesh(new THREE.PlaneGeometry(1, 1),
+    new THREE.MeshBasicMaterial({ color: 0x00ff88, side: THREE.DoubleSide }));
+  const s2 = new THREE.Scene(); s2.add(plain);
+  plain.position.set(0, 0, -0.6);
+  renderer.render(s2, lc);
+  const buf = new Uint8Array(512 * 512 * 4);
+  renderer.readRenderTargetPixels(rt, 0, 0, 512, 512, buf);
+  let green = 0, magenta = 0;
+  for (let i = 0; i < buf.length; i += 4) {
+    if (buf[i + 1] > 100) green++; else magenta++;
+  }
+  results.plainMaterialRender = { greenPixels: green, otherPixels: magenta, sample: Array.from(buf.slice(0, 8)) };
+  renderer.setRenderTarget(null);
+}
+
+// B) 用自定义深度材质渲染
+{
+  renderer.setRenderTarget(rt);
+  renderer.setClearColor(0xffffff, 1);
+  renderer.clear(true, true, false);
+  mesh.material = mats[0];
+  // 直接用 mesh 自己就能验证深度材质
+  const s3 = new THREE.Scene(); s3.add(mesh);
+  renderer.render(s3, lc);
+  const buf = new Uint8Array(512 * 512 * 4);
+  renderer.readRenderTargetPixels(rt, 0, 0, 512, 512, buf);
+  const vals = new Set();
+  let zeroish = 0, nonzero = 0;
+  for (let i = 0; i < buf.length; i += 4) {
+    vals.add(buf[i]);
+    if (buf[i] < 2) zeroish++; else nonzero++;
+  }
+  results.customDepthRender = {
+    zeroish, nonzero,
+    distinctValues: Array.from(vals).sort((a, b) => a - b).slice(0, 20),
+    sample: Array.from(buf.slice(0, 8)),
+  };
+  renderer.setRenderTarget(null);
+}
+
+// C) 换回普通材质渲染 shadow map 目标，检查 clear 是否真的是白色
+{
+  renderer.setRenderTarget(rt);
+  renderer.setClearColor(0xffffff, 1);
+  renderer.clear(true, true, false);
+  const buf = new Uint8Array(512 * 512 * 4);
+  renderer.readRenderTargetPixels(rt, 0, 0, 512, 512, buf);
+  results.clearOnly = { sample: Array.from(buf.slice(0, 8)), w: rt.width, h: rt.height };
+  renderer.setRenderTarget(null);
+}
+
+window.__RES__ = results;
+window.__READY__ = true;
+</script>
+</body></html>

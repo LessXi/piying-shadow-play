@@ -1,0 +1,31 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>verify module</title></head><body>
+<script type="importmap">{ "imports": { "three": "../vendor/three.module.js" } }</script>
+<script type="module">
+window.__CHECK__ = { started: true };
+try {
+  const { WaveScreen } = await import('../src/screen.js');
+  const { markShadowCaster, makeShadowDepthMaterial, makePuppetMaterial } = await import('../src/materials.js');
+  const { Rig } = await import('../src/rig.js');
+  const THREE = await import('three');
+
+  const rs = WaveScreen.prototype.renderShadow.toString();
+  const sr = WaveScreen.prototype.setDebugMode ? WaveScreen.prototype.setDebugMode.toString() : '(none)';
+
+  window.__CHECK__ = {
+    started: true,
+    waveScreenKeys: Object.keys(WaveScreen.prototype),
+    hasRenderShadow: typeof WaveScreen.prototype.renderShadow,
+    renderShadowSrc: rs.slice(0, 300),
+    threeRevision: THREE.REVISION,
+    depthUniformKeys: Object.keys(makeShadowDepthMaterial(null, {}).uniforms || {}),
+    depthIsShader: makeShadowDepthMaterial(null, {}).isShaderMaterial === true,
+    rigIsFn: typeof Rig === 'function',
+    // 抛异常时也能看到
+  };
+} catch (e) {
+  window.__CHECK__ = { started: true, error: String(e && e.stack || e).slice(0, 800) };
+}
+window.__READY__ = true;
+</script>
+</body></html>

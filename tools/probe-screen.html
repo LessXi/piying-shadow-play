@@ -1,0 +1,190 @@
+<!doctype html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><title>engine probe</title>
+<style>html,body{margin:0;background:#000;overflow:hidden}canvas{display:block}</style></head>
+<body>
+<canvas id="c" width="960" height="540"></canvas>
+<script type="importmap">
+{ "imports": { "three": "../vendor/three.module.js" } }
+</script>
+<script type="module">
+// 引擎自检探针：只用已实现的引擎模块，验证
+//   1) 自定义阴影贴图真的能投出剪影
+//   2) alphaTest 的镂空孔洞真的透光（幕布上出现亮斑）
+//   3) 幕布织纹/褶皱可见、光晕在边缘散开
+//   4) 后期泛光链路跑通、多层剪影有前后虚实的层叠感
+import * as THREE from 'three';
+import { Renderer } from '../src/renderer.js';
+import { Stage } from '../src/stage.js';
+import { WaveScreen } from '../src/screen.js';
+import { makeFabricTexture, makeAlphaFromDraw } from '../src/textures.js';
+import { markShadowCaster } from '../src/materials.js';
+
+const qs = new URLSearchParams(location.search);
+const canvas = document.getElementById('c');
+const W = parseInt(qs.get('w') || '960', 10);
+const H = parseInt(qs.get('h') || '540', 10);
+canvas.width = W; canvas.height = H;
+
+const renderer = new Renderer(canvas, { width: W, height: H, pixelRatio: 1 });
+const stage = new Stage({ screenWidth: 4, screenHeight: 2.5, lightFar: 12 });
+renderer.scene.add(stage.group);
+
+const fabric = makeFabricTexture(1024);
+const screen = new WaveScreen({ width: 4, height: 2.5, segX: 160, segY: 100, fabric });
+screen.bindRenderer(renderer.renderer);
+renderer.scene.add(screen.mesh);
+screen.attachLight(stage.light, { lightFar: 12, shadowSize: qs.get('shadow') ? parseInt(qs.get('shadow'), 10) : 2048, clothDiffusion: 0.062 });
+
+/* ---------- 带镂空的测试剪影 ---------- */
+// 约定：遮罩画布上“画到的”就是实体；孔洞用 destination-out 挖掉。
+const TEXW = 512, TEXH = 512;
+const S = TEXW / 512;
+
+function drawFigure(ctx) {
+  // 袍身
+  ctx.beginPath();
+  ctx.moveTo(178 * S, 480 * S); ctx.lineTo(196 * S, 168 * S);
+  ctx.quadraticCurveTo(256 * S, 96 * S, 316 * S, 168 * S);
+  ctx.lineTo(334 * S, 480 * S); ctx.closePath(); ctx.fill();
+  // 头 + 头盔
+  ctx.beginPath(); ctx.arc(256 * S, 118 * S, 70 * S, 0, Math.PI * 2); ctx.fill();
+  ctx.beginPath();
+  ctx.moveTo(180 * S, 104 * S); ctx.quadraticCurveTo(256 * S, 10 * S, 332 * S, 104 * S);
+  ctx.lineTo(318 * S, 128 * S); ctx.quadraticCurveTo(256 * S, 48 * S, 194 * S, 128 * S);
+  ctx.closePath(); ctx.fill();
+  // 四肢
+  ctx.lineWidth = 32 * S; ctx.lineCap = 'round';
+  ctx.beginPath(); ctx.moveTo(198 * S, 200 * S); ctx.lineTo(104 * S, 302 * S); ctx.lineTo(70 * S, 254 * S); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(314 * S, 200 * S); ctx.lineTo(412 * S, 292 * S); ctx.lineTo(452 * S, 240 * S); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(216 * S, 404 * S); ctx.lineTo(198 * S, 506 * S); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(296 * S, 404 * S); ctx.lineTo(320 * S, 506 * S); ctx.stroke();
+  // 兵器：长柄 + 镂空刀身
+  ctx.fillRect(408 * S, 96 * S, 11 * S, 330 * S);
+  ctx.beginPath();
+  ctx.moveTo(414 * S, 96 * S); ctx.quadraticCurveTo(478 * S, 56 * S, 468 * S, 152 * S);
+  ctx.quadraticCurveTo(444 * S, 174 * S, 414 * S, 150 * S); ctx.closePath(); ctx.fill();
+}
+
+function pierceFigure(ctx) {
+  ctx.globalCompositeOperation = 'destination-out';
+  // 胸甲鳞片（交错排列）
+  for (let r = 0; r < 5; r++) {
+    for (let c = 0; c < 4; c++) {
+      const cx = (218 + c * 27) * S + (r % 2) * 13.5 * S;
+      const cy = (206 + r * 30) * S;
+      ctx.beginPath(); ctx.arc(cx, cy, 7.5 * S, 0, Math.PI * 2); ctx.fill();
+    }
+  }
+  // 袍摆缠枝纹：大小孔洞交替
+  for (let i = 0; i < 9; i++) {
+    const cx = (198 + i * 17) * S;
+    const cy = (384 + Math.sin(i * 0.9) * 12) * S;
+    const R = (i % 2 === 0 ? 9 : 5) * S;
+    ctx.beginPath(); ctx.arc(cx, cy, R, 0, Math.PI * 2); ctx.fill();
+  }
+  // 头盔云纹
+  for (let i = 0; i < 6; i++) {
+    ctx.beginPath(); ctx.arc((212 + i * 18) * S, (74 + (i % 2) * 8) * S, (i % 2 ? 4.5 : 7.5) * S, 0, Math.PI * 2); ctx.fill();
+  }
+  // 刀身镂空
+  ctx.beginPath(); ctx.arc(440 * S, 116 * S, 11 * S, 0, Math.PI * 2); ctx.fill();
+  ctx.beginPath(); ctx.arc(431 * S, 141 * S, 6 * S, 0, Math.PI * 2); ctx.fill();
+  // 腰带窗棂
+  for (let i = 0; i < 4; i++) {
+    ctx.fillRect((218 + i * 22) * S, 352 * S, 12 * S, 9 * S);
+  }
+  ctx.globalCompositeOperation = 'source-over';
+}
+
+const texHollow = makeAlphaFromDraw((ctx) => { drawFigure(ctx); pierceFigure(ctx); },
+  { w: TEXW, h: TEXH, baseColor: '#1b0d06', glow: 0.55, parchment: true });
+
+/* ---------- 两层剪影，验证层叠（近实远虚、近小远大） ---------- */
+function makeActor(tex, scale, x, y, z) {
+  const g = new THREE.Group();
+  g.position.set(x, y, z);
+  const m = new THREE.Mesh(new THREE.PlaneGeometry(1.05 * scale, 1.55 * scale), null);
+  m.material = new THREE.MeshBasicMaterial({
+    map: tex, transparent: true, alphaTest: 0.45,
+    side: THREE.DoubleSide, toneMapped: false, color: 0xffffff,
+  });
+  markShadowCaster(m, tex, { alphaTest: 0.45, lightFar: 12 });
+  g.add(m);
+  renderer.scene.add(g);
+  return g;
+}
+
+const near = makeActor(texHollow, 1.0, -0.55, -1.06, -0.25);
+const far = makeActor(texHollow, 1.62, 0.95, -1.06, -1.05);
+
+/* ---------- 循环 ---------- */
+let t = 0, frames = 0, loopError = null;
+let last = performance.now();
+
+function loop(now) {
+  requestAnimationFrame(loop);
+  const dt = Math.min(0.05, (now - last) / 1000) || 1 / 60;
+  last = now;
+  if (loopError) return;   // 出错就停，避免刷屏
+
+  try {
+    t += dt;
+
+    near.rotation.z = Math.sin(t * 0.9) * 0.055;
+    far.rotation.z = Math.sin(t * 0.65 + 1.2) * 0.075;
+    near.position.x = -0.55 + Math.sin(t * 0.5) * 0.14;
+    far.position.x = 0.95 + Math.sin(t * 0.37 + 2) * 0.24;
+
+    stage.setLight({ intensity: 2.6 + Math.sin(t * 3.1) * 0.07 });
+
+    screen.update(dt, stage.light, renderer.camera);
+    screen.renderShadow(renderer.scene);
+    renderer.render(dt);
+    frames++;
+
+    window.__probe = {
+      frames, t,
+      casters: screen.shadowCasterCount,
+      stats: renderer.stats(),
+    };
+  } catch (e) {
+    loopError = String(e && e.stack || e);
+    window.__LOOP_ERROR__ = loopError;
+    console.error('loop failed:', loopError);
+  }
+}
+
+// 允许 ?t= 静态定格
+const t0 = parseFloat(qs.get('t'));
+if (Number.isFinite(t0)) t = t0;
+
+window.__SET_TIME__ = (v) => { t = v; return t; };window.__snapshot = () => canvas.toDataURL('image/png');
+window.__READY__ = true;
+window.__qa = () => (window.__probe ? { ...window.__probe, err: window.__LOOP_ERROR__ || null } : { err: 'no probe yet' });
+// 诊断用句柄
+window.__THREE__ = THREE;
+window.__SHADER_CHECK__ = function () {
+  const m = screen.material;
+  const prog = renderer.renderer.properties.get(m).currentProgram;
+  const gl = renderer.renderer.getContext();
+  const out = { hasProgram: !!prog };
+  if (prog) {
+    const glp = prog.program;
+    const n = gl.getProgramParameter(glp, gl.ACTIVE_UNIFORMS);
+    const names = [];
+    for (let i = 0; i < n; i++) { const u = gl.getActiveUniform(glp, i); if (u) names.push(u.name + ':' + u.type); }
+    out.uniforms = names;
+    out.hasUDebug = names.some(x => x.startsWith('uDebug'));
+    out.linked = gl.getProgramParameter(glp, gl.LINK_STATUS);
+  }
+  return out;
+};
+window.__SCENE__ = renderer.scene;
+window.__RENDERER__ = renderer;
+window.__SHADOW_STAGE__ = screen.shadowStage;
+window.__SCREEN__ = screen;
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>

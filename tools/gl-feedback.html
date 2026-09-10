@@ -1,0 +1,183 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><title>feedback isolate</title>
+<style>html,body{margin:0;background:#000}canvas{display:block}</style></head>
+<body>
+<canvas id="c" width="480" height="270"></canvas>
+<script type="importmap">{ "imports": { "three": "../vendor/three.module.js" } }</script>
+<script type="module">
+// 逐个阶段卸载，定位「反馈回路」到底来自哪一步。
+// 判据：清空 GL 错误后单独跑该阶段，再读 gl.getError() —— 1282(INVALID_OPERATION) 就是它。
+import * as THREE from 'three';
+import { Renderer } from '../src/renderer.js';
+import { Stage } from '../src/stage.js';
+import { WaveScreen } from '../src/screen.js';
+import { makeFabricTexture } from '../src/textures.js';
+import { buildProps } from '../src/props.js';
+
+const canvas = document.getElementById('c');
+const renderer = new Renderer(canvas, { width: 480, height: 270, pixelRatio: 1 });
+const R = renderer.renderer;
+const gl = R.getContext();
+const stage = new Stage({ screenWidth: 4, screenHeight: 2.5, lightFar: 12 });
+renderer.scene.add(stage.group);
+const fabric = makeFabricTexture(256);
+const screen = new WaveScreen({ width: 4, height: 2.5, segX: 40, segY: 24, fabric });
+screen.bindRenderer(renderer);
+renderer.scene.add(screen.mesh);
+screen.attachLight(stage.light, { lightFar: 12, shadowSize: 256, clothDiffusion: 0.062 });
+buildProps(renderer.scene, 12);
+
+function drain() { while (gl.getError() !== 0) { /* 清空历史错误 */ } }
+
+function test(label, fn) {
+  drain();
+  try { fn(); } catch (e) { return { label, err: e.message }; }
+  const codes = [];
+  for (let i = 0; i < 6; i++) { const e = gl.getError(); if (e) codes.push(e); else break; }
+  return { label, glErrors: codes };
+}
+
+const results = [];
+results.push(test('shadow pass (screen.renderShadow)', () => {
+  screen.update(1 / 60, stage.light, renderer.camera);
+  screen.renderShadow(renderer.scene);
+}));
+results.push(test('scene -> compositor.sceneRT', () => {
+  R.setRenderTarget(renderer.compositor.sceneTarget);
+  R.clear(true, true, true);
+  R.render(renderer.scene, renderer.camera);
+  R.setRenderTarget(null);
+}));
+results.push(test('compositor threshold', () => {
+  const c = renderer.compositor;
+  c.uniforms.threshold.tDiffuse.value = c.sceneRT.texture;
+  c._blit(c.thresholdMat, c.levels[0].a);
+}));
+results.push(test('compositor blur L0', () => {
+  const c = renderer.compositor, lv = c.levels[0];
+  c.uniforms.blur.tDiffuse.value = lv.a.texture;
+  c.uniforms.blur.uDir.value.set(1.35 / lv.w, 0);
+  c._blit(c.blurMat, lv.b);
+}));
+results.push(test('compositor composite -> canvas', () => {
+  const c = renderer.compositor;
+  c.uniforms.composite.tScene.value = c.sceneRT.texture;
+  c.uniforms.composite.tBloomA.value = c.levels[0].b.texture;
+  c.uniforms.composite.tBloomB.value = c.levels[1].b.texture;
+  c.uniforms.composite.tBloomC.value = c.levels[2].b.texture;
+  c._blit(c.compositeMat, null);
+}));
+results.push(test('full renderer.render()', () => { renderer.render(1 / 60); }));
+results.push(test('compositor.render() 单独', () => { renderer.compositor.render(1 / 60); }));
+results.push(test('blur 链路完整复刻', () => {
+  const c = renderer.compositor;
+  const src0 = c.levels[0].a;
+  for (let i = 0; i < c.levels.length; i++) {
+    const lv = c.levels[i];
+    const src = i === 0 ? src0 : c.levels[i - 1].b;
+    c.uniforms.blur.tDiffuse.value = src.texture;
+    c.uniforms.blur.uDir.value.set(1.35 / lv.w, 0);
+    c._blit(c.blurMat, lv.a);
+    c.uniforms.blur.tDiffuse.value = lv.a.texture;
+    c.uniforms.blur.uDir.value.set(0, 1.35 / lv.h);
+    c._blit(c.blurMat, lv.b);
+  }
+}));
+results.push(test('单个 _blit: levels[1].b -> levels[2].b', () => {
+  const c = renderer.compositor;
+  c.uniforms.blur.tDiffuse.value = c.levels[1].b.texture;
+  c.uniforms.blur.uDir.value.set(0, 1.35 / c.levels[2].h);
+  c._blit(c.blurMat, c.levels[2].b);
+}));
+results.push(test('loop 到 level0 之前', () => {
+  const c = renderer.compositor;
+  const lv = c.levels[0];
+  c.uniforms.blur.tDiffuse.value = lv.a.texture;
+  c.uniforms.blur.uDir.value.set(1.35 / lv.w, 0);
+  c._blit(c.blurMat, lv.a);
+}));
+results.push(test('loop level0 (a->a)', () => {
+  const c = renderer.compositor;
+  const lv = c.levels[0];
+  c.uniforms.blur.tDiffuse.value = lv.a.texture;
+  c._blit(c.blurMat, lv.a);
+}));
+results.push(test('loop level1 (b->a)', () => {
+  const c = renderer.compositor;
+  const lv = c.levels[1];
+  c.uniforms.blur.tDiffuse.value = c.levels[0].b.texture;
+  c._blit(c.blurMat, lv.a);
+}));
+results.push(test('阈值 sceneRT -> levels[0].a', () => {
+  const c = renderer.compositor;
+  c.uniforms.threshold.tDiffuse.value = c.sceneRT.texture;
+  c._blit(c.thresholdMat, c.levels[0].a);
+}));
+results.push(test('合成 levels[0].b -> canvas', () => {
+  const c = renderer.compositor;
+  c.uniforms.composite.tScene.value = c.sceneRT.texture;
+  c.uniforms.composite.tBloomA.value = c.levels[0].b.texture;
+  c.uniforms.composite.tBloomB.value = c.levels[1].b.texture;
+  c.uniforms.composite.tBloomC.value = c.levels[2].b.texture;
+  c._blit(c.compositeMat, null);
+}));
+results.push(test('每个 RT 单独 _blit 一次（探雷）', () => {
+  const c = renderer.compositor;
+  const probes = [
+    ['sceneRT', c.sceneRT, c.levels[2].b],
+    ['L0.a', c.levels[0].a, c.levels[2].b],
+    ['L0.b', c.levels[0].b, c.levels[2].b],
+    ['L1.a', c.levels[1].a, c.levels[2].b],
+    ['L1.b', c.levels[1].b, c.levels[2].b],
+    ['L2.a', c.levels[2].a, c.levels[2].b],
+    ['L2.b', c.levels[2].b, c.levels[1].b],
+  ];
+  const bad = [];
+  for (const [nm, srcRT, dstRT] of probes) {
+    drain();
+    c.uniforms.blur.tDiffuse.value = srcRT.texture;
+    c._blit(c.blurMat, dstRT);
+    const e = gl.getError();
+    if (e) bad.push(nm + ' -> ' + e);
+  }
+  if (bad.length) throw new Error('feedback: ' + bad.join(', '));
+}));
+
+// --- 从干净状态逐个测（每次先把历史错误排空，并在同一步内立刻读错误）---
+function cleanTest(label, fn) {
+  // 先做一次完全无关的渲染把状态稳定下来
+  R.setRenderTarget(null);
+  R.render(renderer.scene, renderer.camera);
+  drain();
+  fn();
+  const e = gl.getError();
+  drain();
+  return { label, glError: e || 0 };
+}
+
+const clean = [];
+clean.push(cleanTest('A 不同纹理 a->b', () => {
+  const c = renderer.compositor, lv = c.levels[0];
+  c.uniforms.blur.tDiffuse.value = lv.a.texture;
+  c._blit(c.blurMat, lv.b);
+}));
+clean.push(cleanTest('B 同一纹理 a->a', () => {
+  const c = renderer.compositor, lv = c.levels[0];
+  c.uniforms.blur.tDiffuse.value = lv.a.texture;
+  c._blit(c.blurMat, lv.a);
+}));
+clean.push(cleanTest('C 同一纹理 b->b', () => {
+  const c = renderer.compositor, lv = c.levels[1];
+  c.uniforms.blur.tDiffuse.value = lv.b.texture;
+  c._blit(c.blurMat, lv.b);
+}));
+clean.push(cleanTest('D sceneRT -> L0.a', () => {
+  const c = renderer.compositor;
+  c.uniforms.blur.tDiffuse.value = c.sceneRT.texture;
+  c._blit(c.blurMat, c.levels[0].a);
+}));
+
+window.__RES__ = { results, clean };
+window.__READY__ = true;
+</script>
+</body></html>

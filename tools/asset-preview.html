@@ -1,0 +1,626 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>影窗 · 皮影资产自检台</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #000; overflow: hidden; }
+  #wrap { position: relative; width: 1280px; height: 1080px; }
+  #c { position: absolute; left: 0; top: 0; display: block; width: 800px; height: 500px; }
+  #atlas { position: absolute; left: 0; top: 0; display: none; }
+  #err { position: absolute; left: 4px; top: 4px; z-index: 9; margin: 0;
+         color: #ff8080; font: 12px/1.4 ui-monospace, monospace; white-space: pre-wrap; }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <canvas id="c" width="800" height="500"></canvas>
+  <canvas id="atlas" width="1280" height="1080" style="display:none"></canvas>
+  <pre id="err"></pre>
+</div>
+
+<script type="importmap">
+{ "imports": { "three": "../vendor/three.module.js" } }
+</script>
+
+<script type="module">
+// 皮影资产自检台：用**真实引擎链路**（Renderer + Stage + WaveScreen + 真实阴影贴图）渲染 6+1 组姿态，
+// 外加一张"全部部件贴图图集"，用于人眼核验关节连贯性、穿模与镂空亮斑。
+import * as THREE from 'three';
+import { Renderer } from '../src/renderer.js';
+import { Stage } from '../src/stage.js';
+import { WaveScreen } from '../src/screen.js';
+import { makeFabricTexture } from '../src/textures.js';
+import { Rig } from '../src/rig.js';
+import { buildGeneral, buildCavalry, buildProps, partTable, PUPPET_HEIGHT } from '../src/puppet.js';
+
+const W = 800, H = 500;
+const SCREEN_W = 4.0, SCREEN_H = 2.5, LIGHT_FAR = 12;
+const SHADOW_SIZE = 2048;          // 与 main.js 一致，保证"镂空亮斑"验收条件等价
+const ROOT_Y = -1.06;              // 引擎基线 BASE.ty（脚底局部 y=0，影子脚底落在幕布下沿内）
+const GENERAL_Z = -0.25, CAVALRY_Z = -0.55;
+const LIGHT_POS = [0.10, -0.28, -3.2];   // 与 src/stage.js 的 SpotLight 一致
+
+const err = document.getElementById('err');
+const state = { frame: 0, t: 0, pose: 'stand', mode: 'scene', render: 'composite', propsVisible: true };
+window.__FRAMES__ = 0;
+window.__READY__ = false;
+// 抓住构建期的 console 输出（WebGL program 编译失败是 console.error，早于 CDP Runtime.enable）
+window.__LOGS__ = [];
+for (const k of ['log', 'warn', 'error']) {
+  const orig = console[k].bind(console);
+  console[k] = (...a) => {
+    try { window.__LOGS__.push(k + ': ' + a.map((x) => (typeof x === 'string' ? x : (x && x.message) || String(x))).join(' ')); } catch {}
+    orig(...a);
+  };
+}
+
+/* ---------------- 姿态表（绝对欧拉角，弧度；与编排组"绝对角 = rest + delta"一致） ----------------
+   方向约定：向右 +x、向上 +y；下垂肢体的方向角 = -90° + 累计 rz。
+   想清楚"这条骨头要指向哪个方向"，再换算成 rz，就不会摆出反关节。 */
+const D = Math.PI / 180;
+const deg = (d) => d * D;
+const POSES = {
+  // 1) 站立（静息）
+  stand: {
+    note: '站立：静息姿态，双脚着地，刀在右手侧竖直',
+    root: { ty: 0, rz: 0 },
+    gen: {},
+  },
+  // 2) 抬左臂到额前（搭额远眺）
+  raiseLeft: {
+    note: '抬左臂到额前：肩 2.06 + 肘 2.30，手落到额前',
+    root: { ty: -0.005, rz: 0 },
+    gen: {
+      waist: [0, 0, 0.03], chest: [0, 0, 0.06], neck: [0, 0, -0.04], head: [0, 0, -0.10],
+      shoulderL: [0, 0, 0.10], upperArmL: [0, 0, 2.06], forearmL: [0, 0, 2.30], handL: [0, 0, 2.42],
+      upperArmR: [0, 0, -0.18], forearmR: [0, 0, 0.30],
+    },
+  },
+  // 3) 抬右臂举刀过顶（刀身竖直举过头）
+  raiseRightWeapon: {
+    note: '举刀过顶：右上臂 -2.618 / 肘 +0.838 / 刀 1.918（把刀转回竖直）',
+    root: { ty: -0.02, rz: 0 },
+    gen: {
+      chest: [0, 0, -0.05], head: [0, 0, 0.08],
+      upperArmR: [0, 0, -2.618], forearmR: [0, 0, 0.838], handR: [0, 0, -0.05],
+      weapon: [0, 0, 1.918], weaponTip: [0, 0, 0.04],
+      upperArmL: [0, 0, 0.45], forearmL: [0, 0, 0.55],
+    },
+  },
+  // 4) 左腿前迈（走路中段）
+  stepLeft: {
+    note: '左腿前迈：左胯 +0.611/左膝 -0.262 落地，右腿后蹬，双臂反向摆',
+    root: { ty: -0.06, rz: 0 },
+    gen: {
+      thighL: [0, 0, 0.611], shinL: [0, 0, -0.262], footL: [0, 0, -0.25],
+      thighR: [0, 0, -0.436], shinR: [0, 0, 0.349], footR: [0, 0, -0.35],
+      upperArmL: [0, 0, -0.35], forearmL: [0, 0, -0.25],
+      upperArmR: [0, 0, 0.30], forearmR: [0, 0, 0.15],
+      waist: [0, 0, -0.03], chest: [0, 0, 0.04],
+    },
+  },
+  // 5) 转身 45°（root.rz 整身平面内转 + 腰绕竖轴翻面）
+  turn45: {
+    note: '转身 45°：root.rz=0.785 整身旋转 + waist.ry 翻面（平片皮影的正统转法）',
+    root: { ty: -0.03, rz: 0.785 },
+    gen: {
+      waist: [0, 0.55, 0], chest: [0, -0.25, 0], neck: [0, -0.15, 0], head: [0, -0.35, 0],
+      upperArmL: [0, 0, 0.85], forearmL: [0, 0, 0.60],
+      upperArmR: [0, 0, -0.55], forearmR: [0, 0, -0.35],
+      thighL: [0, 0, 0.16], thighR: [0, 0, -0.10],
+    },
+  },
+  // 6) 劈砍定格（大幅劈砍后的定型）
+  chopHold: {
+    note: '劈砍定格：双臂甩向左下，刀横在左低处，左腿前压、重心下沉',
+    root: { ty: -0.075, rz: 0 },
+    gen: {
+      waist: [0, 0, -0.10], chest: [0, 0, -0.22], neck: [0, 0, -0.10], head: [0, 0, -0.18],
+      upperArmR: [0, 0, -1.222], forearmR: [0, 0, 0.175], handR: [0, 0, 0.05],
+      weapon: [0, 0, -3.05], weaponTip: [0, 0, -0.10],
+      upperArmL: [0, 0, 0.95], forearmL: [0, 0, 0.50], handL: [0, 0, 0.15],
+      thighL: [0, 0, 0.42], shinL: [0, 0, -0.30], footL: [0, 0, -0.10],
+      thighR: [0, 0, -0.36], shinR: [0, 0, 0.30], footR: [0, 0, -0.34],
+    },
+  },
+  // 7) 特写（头盔/胸甲镂空细节，相机推近）
+  closeup: {
+    note: '特写：相机推近看头盔、翎羽、胸甲、护心镜的镂空',
+    root: { ty: -0.01, rz: 0 },
+    camera: { pos: [0.02, -0.08, 1.55], look: [0.02, -0.10, 0] },
+    hideCavalry: true,
+    gen: {
+      upperArmL: [0, 0, 0.75], forearmL: [0, 0, 0.95],
+      upperArmR: [0, 0, -0.30], forearmR: [0, 0, -0.35],
+      head: [0, 0, -0.05],
+    },
+  },
+};
+
+const PORTRAIT_CAM = { pos: [0.02, -0.24, 2.6], look: [0.02, -0.27, 0] };   // 竖幅：演员占满画面，便于核验关节与镂空
+const STAGE_CAM = { pos: [0, 0, 3.63], look: [0, 0, 0] };                   // 与引擎相机一致：取景正好等于幕布 4.0×2.5
+let DEFAULT_CAM = PORTRAIT_CAM;
+window.__SET_CAM__ = (which) => { DEFAULT_CAM = which === "stage" ? STAGE_CAM : PORTRAIT_CAM; return which; };
+
+let renderer, stage, screen, general, cavalry, props, fabric;
+
+/* ---------------- 装配（与 src/main.js 同一套链路） ---------------- */
+function boot() {
+  renderer = new Renderer(document.getElementById('c'), { width: W, height: H, pixelRatio: 1 });
+  stage = new Stage({ screenWidth: SCREEN_W, screenHeight: SCREEN_H, lightFar: LIGHT_FAR });
+  renderer.scene.add(stage.group);
+
+  fabric = makeFabricTexture(512);            // 512 足够：自检看的是剪影与镂空，不是织物细节
+  screen = new WaveScreen({ width: SCREEN_W, height: SCREEN_H, segX: 128, segY: 80, fabric });
+  screen.bindRenderer(renderer);
+  renderer.scene.add(screen.mesh);
+  screen.attachLight(stage.light, { lightFar: LIGHT_FAR, shadowSize: SHADOW_SIZE, clothDiffusion: 0.062 });
+
+  general = new Rig({ lightFar: LIGHT_FAR });
+  buildGeneral(general);
+  general.root.position.set(0, 0, GENERAL_Z);
+  renderer.scene.add(general.root);
+
+  cavalry = new Rig({ lightFar: LIGHT_FAR });
+  buildCavalry(cavalry);
+  cavalry.root.position.set(-0.55, 0, CAVALRY_Z);
+  renderer.scene.add(cavalry.root);
+
+  props = buildProps(renderer.scene, LIGHT_FAR);
+
+  // 灯：固定强度（自检要可复现，不接编排的闪烁）。灯位与 src/stage.js 的 SpotLight 一致。
+  stage.setLight({ intensity: 2.6, color: 0xffb45a, pos: LIGHT_POS });
+
+  renderer.camera.position.set(...DEFAULT_CAM.pos);
+  renderer.camera.lookAt(...DEFAULT_CAM.look);
+  renderer.camera.updateProjectionMatrix();
+}
+
+function resetCloth(rig) {
+  for (const key of rig.cloths) {
+    const c = rig.parts.get(key).cloth;
+    if (!c) continue;
+    c.angle = 0; c.vel = 0; c.first = true;
+  }
+}
+
+function hideRigs(hide) {
+  general.root.visible = !hide.general;
+  cavalry.root.visible = !hide.cavalry;
+  props.rig.root.visible = !hide.props;
+}
+
+/**
+ * ⚠ 引擎缺陷绕过（只改自检台，不动引擎文件）。launch 时打一行日志，报告里也能看见。
+ *   (a) src/screen.js:364  `this.uniforms.uLightView` —— ShadowStage 上没有 uniforms 字段，
+ *       renderShadow() 每次都抛 TypeError（整条阴影链路挂掉）。这里给个别名兜底。
+ *   (b) src/screen.js:293  `makeBlurMaterial(this.pre.texture, ...)` —— 模糊链第一级读的是
+ *       **它自己的下游输出** pre，而不是刚从灯视角画好的 map；于是 map 被反复模糊自身，
+ *       最终整张阴影贴图恒为 0（= 全幕布被判定为遮挡，画面全白无剪影）。
+ *       正确接法：blurX 读 map.texture → blurH → blurY → pre → threshold → map。
+ *   (c) src/screen.js:374  阴影通道仍然用 `r.render(scene, light.shadow.camera)` —— 即用各部件的
+ *       **普通材质**（深棕色）画进阴影贴图，而不是 markShadowCaster 准备好的**距离编码**深度材质。
+ *       结果：贴图里存的是颜色不是距离，`sd >= ref` 的比较失去物理意义，镂空孔洞与实体一起被
+ *       预模糊糊平 —— 幕布上剪影对比度只剩不到 1/3，孔洞亮斑完全看不见。
+ *       这里在自检台里按**设计意图**临时把投射体换成 userData.shadowMats[0]，渲完再换回来。
+ */
+const shims = [];
+let shadowMode = 'engine';       // 引擎自己已经能跑对（index.html t=25s 成片验证）；'depth' 仅作为旧引擎兜底保留
+function patchEngineQuirks() {
+  const st = screen.shadowStage;
+  if (!st) return;
+  if (!st.uniforms) {
+    st.uniforms = screen.uniforms;
+    shims.push('(a) ShadowStage.uniforms 兜底（screen.js:364 会抛 TypeError）');
+  }
+  if (st.blurX && st.map && st.blurX.uniforms.tDiffuse.value !== st.map.texture) {
+    st.blurX.uniforms.tDiffuse.value = st.map.texture;
+    shims.push('(b) blurX 输入改回 map.texture（screen.js:293 接了 pre，阴影贴图恒为 0）');
+  }
+}
+
+/** 按设计意图渲染阴影：投射体用距离编码深度材质，孔洞 discard ⇒ 光真的穿过去 */
+function renderShadow() {
+  const st = screen.shadowStage;
+  if (shadowMode === 'engine' || !st) { screen.renderShadow(renderer.scene); return; }
+  const casters = [];
+  renderer.scene.traverse((o) => {
+    if (o.isMesh && o.castShadowRaw && o.userData.shadowMats && o.visible) casters.push(o);
+  });
+  const saved = casters.map((m) => m.material);
+  casters.forEach((m) => { m.material = m.userData.shadowMats[0]; });
+  try {
+    screen.renderShadow(renderer.scene);
+  } finally {
+    casters.forEach((m, i) => { m.material = saved[i]; });
+  }
+  if (!shims.includes('(c) 阴影通道改用距离编码材质（screen.js:374 用的是普通材质）')) {
+    shims.push('(c) 阴影通道改用距离编码材质（screen.js:374 用的是普通材质）');
+  }
+}
+
+function applyPose(name) {
+  const p = POSES[name];
+  if (!p) throw new Error('未知姿态：' + name);
+  const cam = p.camera || DEFAULT_CAM;
+  renderer.camera.position.set(...cam.pos);
+  renderer.camera.lookAt(...cam.look);
+  renderer.camera.updateProjectionMatrix();
+
+  hideRigs({ general: false, cavalry: !!p.hideCavalry, props: !state.propsVisible });
+
+  general.setRootTransform(0, ROOT_Y + (p.root?.ty || 0), p.root?.rz || 0, GENERAL_Z);
+  general.setPose(p.gen || {});
+  resetCloth(general);
+
+  // 副将：同一套姿态（四肢图纸复用），站左侧做层叠对照
+  cavalry.setRootTransform(0, ROOT_Y + (p.root?.ty || 0), (p.root?.rz || 0) * 0.4, CAVALRY_Z);
+  cavalry.setPose(p.gen || {});
+  resetCloth(cavalry);
+
+  props.apply({ sway: { pine: 0.03, tavern: 0.02 } }, 1.5);
+  state.pose = name;
+}
+
+function frameOnce(dt = 1 / 60) {
+  state.t += dt;
+  // 与 main.js 一致：先在 rig 上放好布料用的时间基准，再 update。
+  // 只调 update(dt) 而不给 _elapsed，Rig.update 里 Math.sin(undefined*1.7+phase) 会算出 NaN，
+  // 于是所有带 cloth 的部件（cape/cape2/plume/flag/scarf）矩阵全变 NaN、直接不画或画成乱形。
+  general._elapsed = state.t;
+  cavalry._elapsed = state.t;
+  general.update(dt);
+  cavalry.update(dt);
+  patchEngineQuirks();
+  screen.update(dt, stage.light, renderer.camera);
+  renderShadow();
+  if (state.render === 'raw') {
+    // 绕过后期：直接看幕布着色本身。用于核验"剪影 + 镂空亮斑"是不是真的被画出来、
+    // 而不是被 composite 的曝光/泛光压平（实测 composite 会把整幕压到 0.95 白）。
+    renderer.renderRaw(dt);
+  } else {
+    renderer.render(dt);
+  }
+  state.frame++;
+  window.__FRAMES__ = state.frame;
+}
+
+/* ---------------- 关节自检 ----------------
+   判据：子件贴图矩形与父件贴图矩形必须有实际重叠（≥4mm）。
+   平片皮影的关节就是两块皮子的搭接区：只要搭上，怎么转都不会露缝；
+   这里用各自几何包围盒（不带子树）在世界空间做 AABB 相交，收缩 4mm 后再判，避免"擦边"。 */
+function boxOfMesh(mesh) {
+  const geo = mesh.geometry;
+  if (!geo.boundingBox) geo.computeBoundingBox();
+  return new THREE.Box3().copy(geo.boundingBox).applyMatrix4(mesh.matrixWorld);
+}
+
+function jointReport() {
+  const rows = [];
+  for (const rig of [general, cavalry]) {
+    rig.root.updateMatrixWorld(true);
+    for (const [key, entry] of rig.parts) {
+      if (!entry.spec.parent) continue;
+      const parent = rig.parts.get(entry.spec.parent);
+      const wp = new THREE.Vector3().setFromMatrixPosition(entry.pivot.matrixWorld);
+      const local = parent.mesh.worldToLocal(wp.clone());
+      const pb = boxOfMesh(parent.mesh);
+      const cb = boxOfMesh(entry.mesh);
+      // 平片皮影只在 x/y 上有意义（z 厚度为 0，不能参与收缩判断）
+      const ovx = Math.min(pb.max.x, cb.max.x) - Math.max(pb.min.x, cb.min.x);
+      const ovy = Math.min(pb.max.y, cb.max.y) - Math.max(pb.min.y, cb.min.y);
+      const touching = ovx >= 0.004 && ovy >= 0.004;
+      const pivotInRect = local.x >= pb.min.x && local.x <= pb.max.x && local.y >= pb.min.y && local.y <= pb.max.y;
+      rows.push({
+        key, parent: entry.spec.parent, touching, pivotInRect,
+        overlap: [+ovx.toFixed(4), +ovy.toFixed(4)],
+        gap: touching ? 0 : +Math.max(0, -Math.max(ovx, ovy)).toFixed(4),
+      });
+    }
+  }
+  const bad = rows.filter((r) => !r.touching);
+  return { total: rows.length, separatedCount: bad.length, separated: bad.slice(0, 12), rows };
+}
+
+/* ---------------- 贴图自检：孔洞是否真的透明、是否在剪影内部 ---------------- */
+function textureMetrics() {
+  const out = [];
+  const seen = new Set();
+  for (const [name, entry] of [['general', partTable('general')], ['cavalry', partTable('cavalry')]]) {
+    for (const spec of entry.specs) {
+      if (seen.has(spec.artKey)) continue;
+      seen.add(spec.artKey);
+      const tex = entry.texes.get(spec.artKey);
+      if (!tex) continue;
+      const cv = tex.image;
+      const ctx = cv.getContext('2d');
+      const w = cv.width, h = cv.height;
+      const data = ctx.getImageData(0, 0, w, h).data;
+      const n = w * h;
+      const alpha = new Uint8Array(n);
+      let solid = 0, transparent = 0;
+      for (let i = 0; i < n; i++) {
+        const a = data[i * 4 + 3];
+        alpha[i] = a;
+        if (a >= 128) solid++; else if (a <= 8) transparent++;
+      }
+      // 从四边洪水填充，标记"外面"；剩下的透明像素就是剪影内部的孔洞
+      const outside = new Uint8Array(n);
+      const stack = [];
+      for (let x = 0; x < w; x++) { stack.push(x, 0, x, h - 1); }
+      for (let y = 0; y < h; y++) { stack.push(0, y, w - 1, y); }
+      while (stack.length) {
+        const y = stack.pop(), x = stack.pop();
+        if (x < 0 || y < 0 || x >= w || y >= h) continue;
+        const i = y * w + x;
+        if (outside[i] || alpha[i] > 8) continue;
+        outside[i] = 1;
+        stack.push(x - 1, y, x + 1, y, x, y - 1, x, y + 1);
+      }
+      let hole = 0;
+      for (let i = 0; i < n; i++) if (!outside[i] && alpha[i] <= 8) hole++;
+      out.push({
+        tex: spec.artKey, part: name + ':' + spec.key, pix: [w, h],
+        solidPx: solid, interiorHolePx: hole,
+        holeRatio: +(hole / Math.max(1, solid)).toFixed(4),
+      });
+    }
+  }
+  const tot = out.reduce((a, r) => a + r.interiorHolePx, 0);
+  const solidTot = out.reduce((a, r) => a + r.solidPx, 0);
+  return { textures: out.length, totalInteriorHolePx: tot, totalSolidPx: solidTot, holeRatio: +(tot / Math.max(1, solidTot)).toFixed(4), list: out };
+}
+
+/* ---------------- 贴图图集（人眼核验图纸 + 关节轴心） ---------------- */
+
+/** 内部镂空率：从四边洪水填充标出"皮子外面"，剩下的透明像素即剪影内部孔洞 */
+function holePercent(cv) {
+  const ctx = cv.getContext('2d');
+  const w = cv.width, h = cv.height, n = w * h;
+  const a = ctx.getImageData(0, 0, w, h).data;
+  const alpha = new Uint8Array(n);
+  for (let i = 0; i < n; i++) alpha[i] = a[i * 4 + 3];
+  const outside = new Uint8Array(n);
+  const stack = [];
+  for (let x = 0; x < w; x++) stack.push(x, 0, x, h - 1);
+  for (let y = 0; y < h; y++) stack.push(0, y, w - 1, y);
+  while (stack.length) {
+    const y = stack.pop(), x = stack.pop();
+    if (x < 0 || y < 0 || x >= w || y >= h) continue;
+    const i = y * w + x;
+    if (outside[i] || alpha[i] > 8) continue;
+    outside[i] = 1;
+    stack.push(x - 1, y, x + 1, y, x, y - 1, x, y + 1);
+  }
+  let hole = 0, solid = 0;
+  for (let i = 0; i < n; i++) {
+    if (alpha[i] >= 128) solid++;
+    else if (!outside[i] && alpha[i] <= 8) hole++;
+  }
+  return Math.round((hole / Math.max(1, solid + hole)) * 100);
+}
+
+function buildAtlas() {
+  const cv = document.getElementById('atlas');
+  const ctx = cv.getContext('2d');
+  const CW = 1280, CH = 1080;
+  ctx.fillStyle = '#0b0b0d';
+  ctx.fillRect(0, 0, CW, CH);
+  ctx.fillStyle = '#ffe0a8';
+  ctx.font = 'bold 16px ui-monospace, monospace';
+  ctx.fillText('皮影部件图纸图集（十字 = 旋转轴心 / 关节；亮处 = 镂空透光孔）', 14, 22);
+
+  const cells = [];
+  const seen = new Set();
+  for (const [name, entry] of [['G', partTable('general')], ['C', partTable('cavalry')]]) {
+    for (const spec of entry.specs) {
+      if (seen.has(spec.artKey)) continue;
+      seen.add(spec.artKey);
+      const tex = entry.texes.get(spec.artKey);
+      if (tex) cells.push({ spec, tex, tag: name });
+    }
+  }
+  const pEntry = props.rig;
+  for (const [key, entry] of pEntry.parts) {
+    const tex = entry.mesh.material.map;
+    const spec = entry.spec;
+    cells.push({ spec: { key, pivot: spec.pivot, w: spec.w, h: spec.h, pix: [tex.image.width, tex.image.height], artKey: 'props:' + key }, tex, tag: 'P' });
+  }
+
+  const cols = 7, rows = Math.ceil(cells.length / cols);
+  const cw = (CW - 20) / cols, ch = (CH - 60) / rows;
+  cells.forEach((c, i) => {
+    const cx = 10 + (i % cols) * cw, cy = 40 + Math.floor(i / cols) * ch;
+    // 灯箱底：亮底 + 皮影图纸叠上去，孔洞透出亮底 = 真实的"灯下看皮影"
+    const img = c.tex.image;
+    const pad = 26;
+    const scale = Math.min((cw - pad) / img.width, (ch - pad - 26) / img.height);
+    const dw = img.width * scale, dh = img.height * scale;
+    const dx = cx + (cw - dw) / 2, dy = cy + 12 + (ch - dh - 26) / 2;
+    // 亮底（每条贴图的包围盒范围，看着像灯箱）
+    const g = ctx.createLinearGradient(dx, dy, dx, dy + dh);
+    g.addColorStop(0, '#ffe6b4');
+    g.addColorStop(1, '#f0b871');
+    ctx.fillStyle = g;
+    ctx.fillRect(dx - 3, dy - 3, dw + 6, dh + 6);
+    ctx.imageSmoothingEnabled = false;
+    ctx.drawImage(img, 0, 0, img.width, img.height, dx, dy, dw, dh);
+
+    // 轴心十字：pivot 是米（局部坐标），换算到贴图像素
+    const pvx = (c.spec.pivot[0] / c.spec.w + 0.5) * img.width;
+    const pvy = (0.5 - c.spec.pivot[1] / c.spec.h) * img.height;
+    const mx = dx + pvx * scale, my = dy + pvy * scale;
+    ctx.strokeStyle = '#e01b1b';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(mx - 8, my); ctx.lineTo(mx + 8, my);
+    ctx.moveTo(mx, my - 8); ctx.lineTo(mx, my + 8);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.arc(mx, my, 4, 0, Math.PI * 2);
+    ctx.stroke();
+
+    ctx.fillStyle = '#9fe0ff';
+    ctx.font = 'bold 11px ui-monospace, monospace';
+    ctx.fillText(`[${c.tag}] ${(c.spec.key || c.spec.artKey).slice(0, 22)}`, cx + 8, cy + ch - 22);
+    // 内部镂空率（从底到顶洪水填充算"外面"，剩下的透明像素就是剪影内部孔洞）
+    ctx.fillStyle = '#ffe0a8';
+    ctx.font = '10px ui-monospace, monospace';
+    const holePct = c.holePct != null ? c.holePct : (c.holePct = holePercent(img));
+    ctx.fillText(`${img.width}x${img.height}px  内部镂空 ${holePct}%`, cx + 8, cy + ch - 9);
+  });
+  cv.style.display = 'block';
+  document.getElementById('c').style.display = 'none';
+  state.mode = 'atlas';
+  return { cells: cells.length, cols, rows, size: [CW, CH] };
+}
+
+/* ---------------- 对外接口 ---------------- */
+window.__POSES__ = Object.keys(POSES);
+window.__POSE_INFO__ = Object.fromEntries(Object.entries(POSES).map(([k, v]) => [k, v.note]));
+window.__PUPPET_HEIGHT__ = PUPPET_HEIGHT;
+
+window.__SET_POSE__ = (name, frames = 3) => {
+  document.getElementById('c').style.display = 'block';
+  document.getElementById('atlas').style.display = 'none';
+  state.mode = 'scene';
+  applyPose(name);
+  for (let i = 0; i < frames; i++) frameOnce(1 / 60);
+  return { pose: name, frame: state.frame };
+};
+
+/** 'raw' = 不做后期（Renderer.renderRaw，能看清剪影与镂空亮斑）；'composite' = 引擎完整后期 */
+window.__SET_RENDER__ = (mode) => {
+  state.render = mode === 'composite' ? 'composite' : 'raw';
+  // raw 时把画布当 sRGB 输出，线性值才不会被看成"偏暗"
+  renderer.renderer.outputColorSpace = state.render === 'raw'
+    ? THREE.SRGBColorSpace
+    : THREE.LinearSRGBColorSpace;
+  return state.render;
+};
+
+/** 'depth' = 阴影通道用距离编码材质（设计意图，孔洞真透光）；'color' = 引擎现状（普通材质） */
+window.__SET_SHADOW_MODE__ = (m) => { shadowMode = m === 'depth' ? 'depth' : 'engine'; return shadowMode; };
+
+/**
+ * 阴影贴图预模糊半径。引擎默认 spread=4.5（在 1024² 上 ±9 texel ≈ 幕布上 ±39mm），
+ * 这个尺度会把 9cm 宽的手臂和 3cm 的镂空孔一起糊掉 —— 手臂影子变淡、孔洞亮斑消失。
+ * 自检台允许调小它，用来证明"问题在预模糊尺度，不在资产"。
+ */
+window.__SET_SHADOW_BLUR__ = (spread) => {
+  const st = screen.shadowStage;
+  if (!st) return null;
+  st.blurX.uniforms.uSpread.value = spread;
+  st.blurY.uniforms.uSpread.value = spread;
+  return spread;
+};
+window.__SHIMS__ = () => [...new Set(shims)];
+
+window.__EMPTY_STAGE__ = (frames = 2) => {
+  hideRigs({ general: true, cavalry: true, props: false });
+  for (let i = 0; i < frames; i++) frameOnce(1 / 60);
+  return { frame: state.frame };
+};
+
+/** 只留演员、藏起布景：核验关节与镂空时不受道具影子干扰 */
+window.__SET_PROPS__ = (visible) => {
+  state.propsVisible = !!visible;
+  props.rig.root.visible = state.propsVisible;
+  const st = screen.shadowStage;
+  if (st) st.collect(renderer.scene);
+  return state.propsVisible;
+};
+window.__SET_CAVALRY__ = (visible) => { cavalry.root.visible = !!visible; return !!visible; };
+
+/** 临时藏掉若干部件（例如 cape/flag），用来核验骨架与关节是否连贯 */
+window.__HIDE_PARTS__ = (keys, hide = true) => {
+  for (const k of keys) {
+    general.setPartVisible(k, !hide);
+    cavalry.setPartVisible(k, !hide);
+  }
+  return keys;
+};
+/** 只留 listed 部件（其余全藏），定位"某部件的影子落在哪" */
+window.__ONLY_PARTS__ = (keep) => {
+  const all = [...general.parts.keys()];
+  const hideList = all.filter((k) => !keep.includes(k));
+  window.__HIDE_PARTS__(hideList, true);
+  return hideList.length;
+};
+window.__PART_KEYS__ = () => [...general.parts.keys()];
+
+window.__REPORT__ = () => ({
+  pose: state.pose, frame: state.frame, ready: window.__READY__,
+  parts: { general: general.parts.size, cavalry: cavalry.parts.size, props: props.rig.parts.size },
+  cloths: { general: general.cloths.length, cavalry: cavalry.cloths.length },
+  stats: renderer.stats(),
+  shadowCasters: screen.shadowCasterCount,
+  joints: jointReport(),
+});
+
+/** 阴影链路诊断：阴影相机到底在哪、阴影贴图里有没有东西 */
+window.__SHADOW_DEBUG__ = () => {
+  screen.update(1 / 60, stage.light, renderer.camera);
+  screen.renderShadow(renderer.scene);
+  const st = screen.shadowStage;
+  const r = renderer.renderer;
+  const sample = (rt, cx, cy, n) => {
+    const buf = new Uint8Array(n * n * 4);
+    r.readRenderTargetPixels(rt, Math.max(0, cx - (n >> 1)), Math.max(0, cy - (n >> 1)), n, n, buf);
+    let mn = 255, mx = 0, sum = 0, cnt = 0;
+    for (let i = 0; i < buf.length; i += 4) { const v = buf[i]; if (v < mn) mn = v; if (v > mx) mx = v; sum += v; cnt++; }
+    return { min: mn, max: mx, mean: +(sum / cnt).toFixed(1) };
+  };
+  const cam = st.light.shadow.camera;
+  return {
+    lightPos: st.light.position.toArray().map((v) => +v.toFixed(3)),
+    camPos: cam.position.toArray().map((v) => +v.toFixed(3)),
+    camNearFar: [cam.near, cam.far, +cam.fov.toFixed(1)],
+    camViewInv: cam.matrixWorldInverse.elements.slice(12, 15).map((v) => +v.toFixed(3)),
+    lightHasCastShadow: st.light.castShadow,
+    hasUpdateMatrices: typeof st.light.shadow.updateMatrices,
+    casters: st.collect(renderer.scene),
+    shadowMap: { size: [st.map.width, st.map.height], center: sample(st.map, st.map.width >> 1, st.map.height >> 1, 64) },
+    preBlur: sample(st.pre, st.pre.width >> 1, st.pre.height >> 1, 64),
+    uShadowOn: screen.uniforms.uShadowOn.value,
+    uLightPos: screen.uniforms.uLightPos.value.toArray().map((v) => +v.toFixed(3)),
+    uFarPlane: screen.uniforms.uFarPlane.value,
+    shims: [...new Set(shims)],
+    logs: window.__LOGS__.slice(-12),
+  };
+};
+window.__TEX_METRICS__ = () => textureMetrics();
+window.__ATLAS__ = () => buildAtlas();
+window.__THREE_INFO__ = () => {
+  const gl = renderer.renderer.getContext();
+  const dbg = gl.getExtension('WEBGL_debug_renderer_info');
+  return { version: gl.getParameter(gl.VERSION), renderer: dbg ? gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL) : null };
+};
+/** 调试句柄（自检用，不参与渲染） */
+window.__ENGINE__ = {
+  get renderer() { return renderer; },
+  get stage() { return stage; },
+  get screen() { return screen; },
+  get general() { return general; },
+  get cavalry() { return cavalry; },
+  frameOnce,
+};
+
+/* ---------------- 启动 ---------------- */
+try {
+  boot();
+  applyPose('stand');
+  window.__SET_RENDER__('composite');
+  frameOnce(1 / 60);
+  frameOnce(1 / 60);
+  window.__READY__ = true;
+  console.log('[asset-preview] ready', JSON.stringify(window.__THREE_INFO__()));
+} catch (e) {
+  window.__BUILD_ERROR__ = String((e && e.stack) || e);
+  err.textContent = window.__BUILD_ERROR__;
+  console.error(e);
+}
+</script>
+</body>
+</html>

@@ -1,0 +1,219 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>shadow stage isolation</title>
+<style>html,body{margin:0;background:#000}canvas{display:block}</style></head>
+<body>
+<canvas id="c" width="300" height="300"></canvas>
+<script type="importmap">{ "imports": { "three": "../vendor/three.module.js" } }</script>
+<script type="module">
+import * as THREE from 'three';
+import { makeFabricTexture, makeAlphaFromDraw } from '../src/textures.js';
+import { Stage } from '../src/stage.js';
+import { Renderer } from '../src/renderer.js';
+import { WaveScreen } from '../src/screen.js';
+import { markShadowCaster } from '../src/materials.js';
+
+const shaderErrs = [];
+const canvas = document.getElementById('c');
+const renderer = new Renderer(canvas, { width: 300, height: 300, pixelRatio: 1 });
+renderer.renderer.debug.onShaderError = (gl, program, vs, fs) => {
+  shaderErrs.push({ vs: gl.getShaderInfoLog(vs), fs: gl.getShaderInfoLog(fs) });
+  console.error('SHADER ERROR', gl.getShaderInfoLog(vs), gl.getShaderInfoLog(fs));
+};
+const stage = new Stage({ screenWidth: 4, screenHeight: 2.5, lightFar: 12 });
+renderer.scene.add(stage.group);
+
+const fabric = makeFabricTexture(64);
+const screen = new WaveScreen({ width: 4, height: 2.5, segX: 8, segY: 8, fabric });
+screen.bindRenderer(renderer);
+renderer.scene.add(screen.mesh);
+screen.attachLight(stage.light, { lightFar: 12, shadowSize: 256 });
+
+const tex = makeAlphaFromDraw((ctx, w, h) => {
+  ctx.beginPath(); ctx.arc(w / 2, h / 2, w * 0.30, 0, Math.PI * 2); ctx.fill();
+}, { w: 64, h: 64, baseColor: '#1b0d06', glow: 0 });
+const mesh = new THREE.Mesh(new THREE.PlaneGeometry(1.2, 1.2),
+  new THREE.MeshBasicMaterial({ map: tex, transparent: true, alphaTest: 0.45, side: THREE.DoubleSide }));
+markShadowCaster(mesh, tex, { alphaTest: 0.45, lightFar: 12 });
+mesh.position.set(0, 0, -0.6);
+renderer.scene.add(mesh);
+
+const R = renderer.renderer;
+const res = {};
+function readRT(rt) {
+  const w = rt.width, h = rt.height;
+  const buf = new Uint8Array(w * h * 4);
+  R.readRenderTargetPixels(rt, 0, 0, w, h, buf);
+  const vals = new Map();
+  for (let i = 0; i < buf.length; i += 4) vals.set(buf[i], (vals.get(buf[i]) || 0) + 1);
+  return Array.from(vals.entries()).sort((a, b) => b[1] - a[1]).slice(0, 6);
+}
+
+// 1) 只读 clear
+R.setRenderTarget(screen.shadowStage.map);
+R.setClearColor(0xffffff, 1);
+R.clear(true, true, false);
+R.setRenderTarget(null);
+res.afterClear = screen.shadowStage.readStats(R);
+
+// 2) 走完整的 renderShadow 流程（开启 step1 抓捕）
+screen.shadowStage.captureAfterStep1 = true;
+screen.update(1 / 60, stage.light, renderer.camera);
+screen.renderShadow(renderer.scene);
+res.diag = JSON.parse(JSON.stringify(screen.shadowStage.diag));
+res.step1 = JSON.parse(JSON.stringify(screen.shadowStage.step1Debug));
+res.afterShadow = screen.shadowStage.readStats(R);
+res.afterPreBlur = screen.shadowStage.readStats(R, screen.shadowStage.pre);
+res.blurHTex = screen.shadowStage.blurH.texture;
+res.preTex = screen.shadowStage.pre.texture;
+res.blurXUniforms = {
+  tDiffuseIsPre: screen.shadowStage.blurX.uniforms.tDiffuse.value === screen.shadowStage.pre.texture,
+  uDir: screen.shadowStage.blurX.uniforms.uDir.value.toArray(),
+  uTexel: screen.shadowStage.blurX.uniforms.uTexel.value.toArray(),
+  uSpread: screen.shadowStage.blurX.uniforms.uSpread.value,
+};
+res.preBlurOwnSlot = screen.shadowStage.readStats(R, screen.shadowStage.blurH);
+
+// 手动重放 blur 链路
+{
+  const st = screen.shadowStage;
+  const q = st.quad, s = st.quadScene, c = st.quadCam;
+  const prev = q.material;
+  q.material = st.blurX;
+  R.setRenderTarget(st.blurH);
+  R.setClearColor(0x000000, 1);
+  R.clear(true, true, false);
+  R.render(s, c);
+  res.manualBlurH = st.readStats(R, st.blurH);
+  q.material = st.blurY;
+  R.setRenderTarget(st.pre);
+  R.clear(true, true, false);
+  R.render(s, c);
+  res.manualPre = st.readStats(R, st.pre);
+  q.material = st.thresholdMat;
+  R.setRenderTarget(st.map);
+  R.clear(true, true, false);
+  R.render(s, c);
+  res.manualThreshold = st.readStats(R, st.map);
+  q.material = prev;
+  R.setRenderTarget(null);
+}
+
+// 3) 直接调 ShadowStage.render 的内部第一步（手动重放）
+R.setRenderTarget(screen.shadowStage.map);
+R.setClearColor(0xffffff, 1);
+R.clear(true, true, false);
+R.render(renderer.scene, stage.light.shadow.camera);
+R.setRenderTarget(null);
+res.afterManualShadow = readRT(screen.shadowStage.map);
+
+// 4) 把 shadow map 作为纹理画到 canvas 上，肉眼可看
+{
+  const quad = new THREE.Mesh(new THREE.PlaneGeometry(2, 2),
+    new THREE.MeshBasicMaterial({ map: screen.shadowStage.map.texture }));
+  const s = new THREE.Scene(); s.add(quad);
+  R.setRenderTarget(null);
+  R.setClearColor(0x000000, 1);
+  R.clear(true, true, true);
+  R.render(s, new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1));
+}
+
+// 6) 验证猜测：quadCam 的 near=0 会让全屏四边形在近平面处被裁掉
+{
+  const st = screen.shadowStage;
+  res.quadCamBefore = { near: st.quadCam.near, far: st.quadCam.far, pos: st.quadCam.position.toArray() };
+  st.quadCam.near = 0.1;
+  st.quadCam.far = 10;
+  st.quadCam.position.z = 1;
+  st.quadCam.updateProjectionMatrix();
+  st.quadCam.updateMatrixWorld(true);
+  // 重放 blur 链路
+  R.setRenderTarget(st.map);
+  R.setClearColor(0xffffff, 1);
+  R.clear(true, true, false);
+  R.render(renderer.scene, stage.light.shadow.camera);
+  R.setRenderTarget(null);
+  res.mapAfterFix = st.readStats(R);
+  const q = st.quad, s = st.quadScene, c = st.quadCam;
+  q.material = st.blurX;
+  R.setRenderTarget(st.blurH);
+  R.setClearColor(0xffffff, 1);
+  R.info.reset();
+  R.clear(true, true, false);
+  res.blurHClearedToWhite = st.readStats(R, st.blurH);
+  R.render(s, c);
+  res.blurHDraws = { calls: R.info.render.calls, tris: R.info.render.triangles };
+  res.blurHAfterFix = st.readStats(R, st.blurH);
+
+  // 把 blurH 贴到画布上，肉眼确认
+  {
+    const dbg = new THREE.Mesh(new THREE.PlaneGeometry(2, 2),
+      new THREE.MeshBasicMaterial({ map: st.blurH.texture }));
+    const ds = new THREE.Scene(); ds.add(dbg);
+    R.setRenderTarget(null);
+    R.setClearColor(0x220000, 1);
+    R.clear(true, true, true);
+    R.render(ds, new THREE.OrthographicCamera(-1, 1, 1, -1, 0.1, 10));
+  }
+
+  // 对照实验：写死输出红色，看 quad 通不通
+  {
+    const testMat = new THREE.ShaderMaterial({
+      uniforms: { tDiffuse: { value: st.pre.texture }, uDir: { value: new THREE.Vector2(1, 0) },
+        uTexel: { value: new THREE.Vector2(1 / 256, 1 / 256) }, uSpread: { value: 4.5 } },
+      vertexShader: st.blurX.vertexShader,
+      fragmentShader: 'precision highp float;\nvarying vec2 vUv;\nvoid main(){ gl_FragColor = vec4(1.0, 0.0, 0.0, 1.0); }',
+      depthTest: false, depthWrite: false,
+    });
+    q.material = testMat;
+    R.setRenderTarget(st.blurH); R.clear(true, true, false); R.render(s, c);
+    res.controlRed = st.readStats(R, st.blurH);
+
+    // 输出 vUv
+    const uvMat = new THREE.ShaderMaterial({
+      uniforms: {},
+      vertexShader: st.blurX.vertexShader,
+      fragmentShader: 'precision highp float;\nvarying vec2 vUv;\nvoid main(){ gl_FragColor = vec4(vUv, 0.0, 1.0); }',
+      depthTest: false, depthWrite: false,
+    });
+    q.material = uvMat;
+    R.setRenderTarget(st.blurH); R.clear(true, true, false); R.render(s, c);
+    const uvbuf = new Uint8Array(256 * 256 * 4);
+    R.readRenderTargetPixels(st.blurH, 0, 0, 256, 256, uvbuf);
+    res.controlUV = {
+      corner00: [uvbuf[0], uvbuf[1]],
+      centre: [uvbuf[(128 * 256 + 128) * 4], uvbuf[(128 * 256 + 128) * 4 + 1]],
+      corner11: [uvbuf[(255 * 256 + 255) * 4], uvbuf[(255 * 256 + 255) * 4 + 1]],
+    };
+
+    // 采样 pre 的 tDiffuse，直接输出 R
+    q.material = st.blurX;
+    R.setRenderTarget(st.blurH); R.clear(true, true, false); R.render(s, c);
+    const sampbuf = new Uint8Array(256 * 256 * 4);
+    R.readRenderTargetPixels(st.blurH, 0, 0, 256, 256, sampbuf);
+    let mn = 255, mx = 0;
+    for (let i = 0; i < sampbuf.length; i += 4) { mn = Math.min(mn, sampbuf[i]); mx = Math.max(mx, sampbuf[i]); }
+    res.blurSampleStats = { min: mn, max: mx };
+  }
+  res.blurXTdiffuseIsPre = st.blurX.uniforms.tDiffuse.value === st.pre.texture;
+  res.blurXHasMapUniform = !!st.blurX.uniforms.map;
+  res.preTextureProps = {
+    isTexture: !!(st.pre.texture && st.pre.texture.isTexture),
+    hasImage: !!(st.pre.texture && st.pre.texture.image),
+    texWidth: st.pre.texture && st.pre.texture.image && st.pre.texture.image.width,
+    type: st.pre.texture && st.pre.texture.type,
+    format: st.pre.texture && st.pre.texture.format,
+  };
+  q.material = st.blurY;
+  R.setRenderTarget(st.pre); R.clear(true, true, false); R.render(s, c);
+  res.preAfterFix = st.readStats(R, st.pre);
+  q.material = st.thresholdMat;
+  R.setRenderTarget(st.map); R.clear(true, true, false); R.render(s, c);
+  res.mapFinalAfterFix = st.readStats(R, st.map);
+  R.setRenderTarget(null);
+}
+
+window.__RES__ = res;
+window.__SHADER_ERRS__ = shaderErrs;
+window.__READY__ = true;
+</script>
+</body></html>

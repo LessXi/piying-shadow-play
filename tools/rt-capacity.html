@@ -1,0 +1,76 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>rt capacity</title>
+<style>html,body{margin:0;background:#000}canvas{display:block}</style></head>
+<body>
+<canvas id="c" width="256" height="256"></canvas>
+<script type="importmap">{ "imports": { "three": "../vendor/three.module.js" } }</script>
+<script type="module">
+import * as THREE from 'three';
+import { Renderer } from '../src/renderer.js';
+
+const canvas = document.getElementById('c');
+const renderer = new Renderer(canvas, { width: 256, height: 256, pixelRatio: 1 });
+const R = renderer.renderer;
+const gl = R.getContext();
+
+const exts = {};
+for (const e of ['EXT_color_buffer_float', 'EXT_color_buffer_half_float', 'OES_texture_float',
+  'OES_texture_half_float', 'WEBGL_color_buffer_float', 'EXT_float_blend']) {
+  exts[e] = !!gl.getExtension(e);
+}
+
+function testRT(label, opts) {
+  const rt = new THREE.WebGLRenderTarget(64, 64, opts);
+  R.setRenderTarget(rt);
+  R.setClearColor(0.5, 0.25, 0.125, 1);
+  R.clear(true, true, false);
+  const status = gl.checkFramebufferStatus(gl.FRAMEBUFFER);
+  const errAfterClear = gl.getError();
+  // 画一个亮色四边形
+  const quad = new THREE.Mesh(new THREE.PlaneGeometry(2, 2),
+    new THREE.MeshBasicMaterial({ color: 0x99ccff, toneMapped: false }));
+  const s = new THREE.Scene(); s.add(quad);
+  R.render(s, new THREE.OrthographicCamera(-1, 1, 1, -1, 0.1, 10));
+  const errAfterDraw = gl.getError();
+  R.setRenderTarget(null);
+  let bytes = null, floats = null, errB = null, errF = null;
+  try {
+    const b = new Uint8Array(64 * 64 * 4);
+    R.readRenderTargetPixels(rt, 0, 0, 64, 64, b);
+    bytes = Array.from(b.slice(0, 8));
+  } catch (e) { errB = String(e).slice(0, 90); }
+  try {
+    const f = new Float32Array(64 * 64 * 4);
+    R.readRenderTargetPixels(rt, 0, 0, 64, 64, f);
+    floats = Array.from(f.slice(0, 8)).map((v) => +v.toFixed(3));
+  } catch (e) { errF = String(e).slice(0, 90); }
+  rt.dispose();
+  return {
+    label,
+    status: status === gl.FRAMEBUFFER_COMPLETE ? 'COMPLETE' : 'INCOMPLETE(' + status + ')',
+    errAfterClear, errAfterDraw,
+    bytes, floats, errB, errF,
+  };
+}
+
+const results = [];
+results.push(testRT('HalfFloat RGBA', { format: THREE.RGBAFormat, type: THREE.HalfFloatType, depthBuffer: true }));
+results.push(testRT('UnsignedByte RGBA', { format: THREE.RGBAFormat, type: THREE.UnsignedByteType, depthBuffer: true }));
+results.push(testRT('HalfFloat depth=false', { format: THREE.RGBAFormat, type: THREE.HalfFloatType, depthBuffer: false }));
+results.push(testRT('Float RGBA', { format: THREE.RGBAFormat, type: THREE.FloatType, depthBuffer: true }));
+
+window.__RES__ = {
+  exts,
+  rendererHdrSupported: renderer.hdrSupported,
+  isWebGL2: renderer.isWebGL2,
+  sceneRTComplete: (function () {
+    R.setRenderTarget(renderer.compositor.sceneTarget);
+    const s = gl.checkFramebufferStatus(gl.FRAMEBUFFER);
+    R.setRenderTarget(null);
+    return s === gl.FRAMEBUFFER_COMPLETE ? 'COMPLETE' : 'INCOMPLETE(' + s + ')';
+  })(),
+  results,
+};
+window.__READY__ = true;
+</script>
+</body></html>

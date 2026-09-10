@@ -1,0 +1,63 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>debug mode repro</title>
+<style>html,body{margin:0;background:#000}canvas{display:block}</style></head>
+<body>
+<canvas id="c" width="320" height="180"></canvas>
+<script type="importmap">{ "imports": { "three": "../vendor/three.module.js" } }</script>
+<script type="module">
+import * as THREE from 'three';
+import { makeFabricTexture, makeAlphaFromDraw } from '../src/textures.js';
+import { Stage } from '../src/stage.js';
+import { Renderer } from '../src/renderer.js';
+import { WaveScreen } from '../src/screen.js';
+import { markShadowCaster } from '../src/materials.js';
+
+const canvas = document.getElementById('c');
+const renderer = new Renderer(canvas, { width: 320, height: 180, pixelRatio: 1 });
+const stage = new Stage({ screenWidth: 4, screenHeight: 2.5, lightFar: 12 });
+renderer.scene.add(stage.group);
+const fabric = makeFabricTexture(512);
+const screen = new WaveScreen({ width: 4, height: 2.5, segX: 40, segY: 24, fabric });
+screen.bindRenderer(renderer);
+renderer.scene.add(screen.mesh);
+screen.attachLight(stage.light, { lightFar: 12, shadowSize: 256 });
+
+const tex = makeAlphaFromDraw((ctx, w, h) => {
+  ctx.beginPath(); ctx.arc(w / 2, h / 2, w * 0.3, 0, Math.PI * 2); ctx.fill();
+}, { w: 128, h: 128, baseColor: '#1b0d06', glow: 0.5 });
+const mesh = new THREE.Mesh(new THREE.PlaneGeometry(1.05, 1.55),
+  new THREE.MeshBasicMaterial({ map: tex, transparent: true, alphaTest: 0.45, side: THREE.DoubleSide, toneMapped: false }));
+markShadowCaster(mesh, tex, { alphaTest: 0.45, lightFar: 12 });
+mesh.position.set(-0.5, -1.24, -0.15);
+renderer.scene.add(mesh);
+
+function frame() {
+  screen.update(1 / 60, stage.light, renderer.camera);
+  screen.renderShadow(renderer.scene);
+  renderer.render(1 / 60);
+}
+
+const out = {};
+// 正常渲染
+frame();
+out.normal = true;
+
+// 调试模式 4：把 shadowUV 直接画出来
+screen.setDebugMode(4);
+frame();
+out.mode4 = screen.uniforms.uDebug.value;
+
+// 直接读默认帧缓冲
+const gl = renderer.renderer.getContext();
+const px = new Uint8Array(4);
+gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+gl.readPixels(160, 90, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, px);
+out.pxMode4 = Array.from(px);
+out.glErr = gl.getError();
+
+window.__RES__ = out;
+window.__SCREEN__ = screen;
+window.__RENDERER__ = renderer;
+window.__READY__ = true;
+</script>
+</body></html>

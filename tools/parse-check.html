@@ -1,0 +1,38 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>bundle parse check</title></head><body>
+<script>
+// 在浏览器里解析打包结果，报出精确的语法错误位置（Chrome 的解析器就是最终裁判）
+window.__CHECK__ = { phase: 'start' };
+fetch('index.bundle.js')
+  .then((r) => r.text())
+  .then((txt) => {
+    window.__CHECK__.len = txt.length;
+    try {
+      // eslint-disable-next-line no-new-func
+      new Function(txt);
+      window.__CHECK__.ok = true;
+    } catch (e) {
+      window.__CHECK__.ok = false;
+      window.__CHECK__.message = String(e && e.message);
+      // 逐行逼近：找到第一行让整体解析失败的位置
+      const lines = txt.split('\n');
+      let lo = 1, hi = lines.length;
+      const parses = (n) => {
+        try { new Function(lines.slice(0, n).join('\n') + '\n}'); return true; } catch (_) { return false; }
+      };
+      // 简单做法：二分找第一个"加上这一块就坏"的位置
+      let bad = -1;
+      for (let step = 500; step <= lines.length; step += 500) {
+        if (!parses(step)) { bad = step; break; }
+      }
+      window.__CHECK__.firstBadChunk = bad;
+      if (bad > 0) {
+        window.__CHECK__.context = lines.slice(Math.max(0, bad - 8), bad + 4)
+          .map((l, i) => (Math.max(1, bad - 7) + i) + ': ' + l.slice(0, 150));
+      }
+    }
+    window.__CHECK__.done = true; window.__READY__ = true;
+  })
+  .catch((e) => { window.__CHECK__.fetchError = String(e); window.__CHECK__.done = true; window.__READY__ = true; });
+</script>
+</body></html>

@@ -1,0 +1,125 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>raw scene values</title>
+<style>html,body{margin:0;background:#000}</style></head>
+<body><canvas id="c" width="320" height="180"></canvas>
+<script type="importmap">{ "imports": { "three": "../vendor/three.module.js" } }</script>
+<script type="module">
+import * as THREE from 'three';
+import { makeFabricTexture, makeAlphaFromDraw } from '../src/textures.js';
+import { Stage } from '../src/stage.js';
+import { Renderer } from '../src/renderer.js';
+import { WaveScreen } from '../src/screen.js';
+import { markShadowCaster } from '../src/materials.js';
+
+const canvas = document.getElementById('c');
+const renderer = new Renderer(canvas, { width: 320, height: 180, pixelRatio: 1 });
+const R = renderer.renderer;
+const stage = new Stage({ screenWidth: 4, screenHeight: 2.5, lightFar: 12 });
+renderer.scene.add(stage.group);
+const fabric = makeFabricTexture(256);
+const screen = new WaveScreen({ width: 4, height: 2.5, segX: 48, segY: 32, fabric });
+screen.bindRenderer(renderer);
+renderer.scene.add(screen.mesh);
+screen.attachLight(stage.light, { lightFar: 12, shadowSize: 512 });
+
+const tex = makeAlphaFromDraw((ctx, w, h) => {
+  ctx.beginPath();
+  ctx.moveTo(w * 0.36, h * 0.94); ctx.lineTo(w * 0.42, h * 0.25);
+  ctx.lineTo(w * 0.58, h * 0.25); ctx.lineTo(w * 0.64, h * 0.94); ctx.closePath(); ctx.fill();
+  ctx.beginPath(); ctx.arc(w * 0.5, h * 0.19, w * 0.13, 0, Math.PI * 2); ctx.fill();
+}, { w: 128, h: 192, baseColor: '#1b0d06', glow: 0.5 });
+const mesh = new THREE.Mesh(new THREE.PlaneGeometry(1.05, 1.55),
+  new THREE.MeshBasicMaterial({ map: tex, transparent: true, alphaTest: 0.45, side: THREE.DoubleSide, toneMapped: false }));
+markShadowCaster(mesh, tex, { alphaTest: 0.45, lightFar: 12 });
+mesh.position.set(-0.4, -1.24, -0.16);
+renderer.scene.add(mesh);
+
+// 用 HalfFloat RT 读线性 HDR 值
+const rt = new THREE.WebGLRenderTarget(320, 180, {
+  minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter,
+  format: THREE.RGBAFormat, type: THREE.HalfFloatType, depthBuffer: true, stencilBuffer: false,
+});
+
+function scan(label, grid) {
+  R.setRenderTarget(rt);
+  R.setClearColor(0x000000, 1);
+  R.clear(true, true, true);
+  R.render(renderer.scene, renderer.camera);
+  R.setRenderTarget(null);
+  const buf = new Float32Array(320 * 180 * 4);
+  R.readRenderTargetPixels(rt, 0, 0, 320, 180, buf);
+  const rows = [];
+  const nx = grid ? 8 : 16, ny = grid ? 5 : 1;
+  for (let gy = 0; gy < ny; gy++) {
+    const r2 = [];
+    for (let gx = 0; gx < nx; gx++) {
+      const x = Math.floor((gx + 0.5) / nx * 320);
+      const y = grid ? Math.floor((gy + 0.5) / ny * 180) : 90;
+      const i = (y * 320 + x) * 4;
+      r2.push(buf[i].toFixed(3));
+    }
+    rows.push((grid ? `y${gy}: ` : '') + r2.join(' '));
+  }
+  return rows;
+}
+
+/** 用 three 自带的 HDR 场景 RT 直接读（Float32Array） */
+function scanHDR() {
+  const srt = renderer.compositor.sceneTarget;
+  R.setRenderTarget(srt);
+  R.clear(true, true, true);
+  R.render(renderer.scene, renderer.camera);
+  R.setRenderTarget(null);
+  const buf = new Float32Array(srt.width * srt.height * 4);
+  try { R.readRenderTargetPixels(srt, 0, 0, srt.width, srt.height, buf); } catch (e) { return ['err: ' + e.message]; }
+  const rows = [];
+  for (let gy = 0; gy < 5; gy++) {
+    const r2 = [];
+    for (let gx = 0; gx < 8; gx++) {
+      const x = Math.floor((gx + 0.5) / 8 * srt.width);
+      const y = Math.floor((gy + 0.5) / 5 * srt.height);
+      r2.push(buf[(y * srt.width + x) * 4].toFixed(3));
+    }
+    rows.push(`y${gy}: ` + r2.join(' '));
+  }
+  return rows;
+}
+
+const res = {};
+screen.setDebugMode(0);
+screen.update(1 / 60, stage.light, renderer.camera);
+screen.renderShadow(renderer.scene);
+res.final = scan('final', true);
+res.hdr = scanHDR();
+res.uniforms = {
+  rangeNear: screen.uniforms.uRangeNear.value,
+  rangeFar: screen.uniforms.uRangeFar.value,
+  lightIntensity: screen.uniforms.uLightIntensity.value,
+  lightCosOuter: screen.uniforms.uLightCosOuter.value,
+  cameraZDir: screen.uniforms.uCameraZDir.value,
+  shadowOn: screen.uniforms.uShadowOn.value,
+  shadowBias: screen.uniforms.uShadowBias.value,
+  clothDiffusion: screen.uniforms.uClothDiffusion.value,
+  texel: screen.uniforms.uShadowTexel.value,
+  sceneRTType: renderer.compositor.sceneTarget.texture.type,
+};
+
+// 对照：把幕布材质换成普通 MeshBasicMaterial，看是否正常变黑/变亮
+res.withBasicMat = (function () {
+  const mesh = screen.mesh;
+  const saved = mesh.material;
+  mesh.material = new THREE.MeshBasicMaterial({ color: 0x804020, side: THREE.DoubleSide });
+  const rows = scanHDR();
+  mesh.material = saved;
+  return rows;
+})();
+
+// 只显示 shadow
+screen.setDebugMode(1);
+res.shadowOnly = scanHDR();
+screen.setDebugMode(0);
+
+window.__RES__ = res;
+window.__READY__ = true;
+</script>
+</body></html>

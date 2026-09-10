@@ -1,0 +1,156 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>影窗 · 夜巡 —— 一场皮影戏</title>
+<style>
+  :root{
+    --amber:#ffb45a; --amber-dim:#c9873c; --ink:#0a0603;
+    --paper:#f3e2c7;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%;background:#050301;color:var(--paper);
+    font-family:-apple-system,"Segoe UI","PingFang SC","Microsoft YaHei",system-ui,sans-serif;
+    overflow:hidden;-webkit-font-smoothing:antialiased}
+  #app{position:relative;width:100vw;height:100vh;display:flex;flex-direction:column;
+    align-items:center;justify-content:center;gap:14px}
+
+  /* 观众席的暗环境光 */
+  #app::before{content:"";position:absolute;inset:0;
+    background:
+      radial-gradient(120% 80% at 50% 42%, rgba(255,168,72,.10) 0%, rgba(120,60,10,.05) 34%, rgba(0,0,0,0) 62%),
+      radial-gradient(60% 45% at 50% 8%, rgba(255,200,130,.05), rgba(0,0,0,0) 70%),
+      linear-gradient(180deg,#070402 0%,#030201 55%,#000 100%);
+    pointer-events:none}
+
+  #stage-wrap{position:relative;line-height:0;
+    border-radius:6px;
+    box-shadow:
+      0 0 0 1px rgba(255,180,90,.10),
+      0 0 60px 8px rgba(255,150,50,.075),
+      0 26px 70px -14px rgba(0,0,0,.95);
+  }
+
+  canvas#stage-canvas{display:block;border-radius:5px;background:#000}
+
+  /* 幕布四周的木框 / 挂杆 */
+  #frame{position:absolute;inset:-9px;border-radius:9px;pointer-events:none;
+    border:1px solid rgba(255,190,110,.10);
+    box-shadow:inset 0 0 22px rgba(0,0,0,.85)}
+
+  /* 唱词 / 旁白 */
+  #subtitle{position:absolute;left:0;right:0;bottom:6.5%;text-align:center;
+    font-size:clamp(13px,1.55vw,20px);letter-spacing:.22em;
+    color:#ffe6bd;text-shadow:0 0 14px rgba(255,170,70,.55),0 1px 2px rgba(0,0,0,.9);
+    opacity:0;transition:opacity .32s ease;pointer-events:none;font-weight:300}
+  #subtitle.show{opacity:1}
+
+  #hud{display:flex;align-items:center;gap:14px;width:min(94vw,1180px);
+    padding:0 4px;font-size:12px;color:#c9a879;position:relative;z-index:4}
+
+  #perf-title{font-size:13px;letter-spacing:.34em;color:#e8c894;white-space:nowrap;
+    text-shadow:0 0 12px rgba(255,170,70,.35)}
+  #act-name{font-size:12px;letter-spacing:.2em;color:var(--amber-dim);white-space:nowrap}
+
+  #act-bar{display:flex;gap:6px;flex-wrap:wrap}
+  .act-chip{font:inherit;font-size:11px;letter-spacing:.12em;cursor:pointer;
+    color:#b08a58;background:rgba(255,170,80,.05);
+    border:1px solid rgba(255,180,90,.20);border-radius:999px;padding:3px 10px;
+    transition:.18s all}
+  .act-chip:hover{color:#ffd9a0;border-color:rgba(255,190,110,.5);background:rgba(255,170,80,.12)}
+  .act-chip.on{color:#1a0d03;background:var(--amber);border-color:var(--amber);
+    box-shadow:0 0 16px rgba(255,170,70,.5)}
+
+  #btn-play{font:inherit;cursor:pointer;width:30px;height:30px;border-radius:50%;
+    color:#ffd9a0;background:rgba(255,170,80,.08);border:1px solid rgba(255,180,90,.28);
+    display:grid;place-items:center;font-size:12px;transition:.18s all}
+  #btn-play:hover{background:rgba(255,170,80,.2);box-shadow:0 0 18px rgba(255,170,70,.35)}
+
+  #scrub{-webkit-appearance:none;appearance:none;flex:1;height:3px;border-radius:2px;
+    background:linear-gradient(90deg,rgba(255,180,90,.55),rgba(255,180,90,.12));outline:none}
+  #scrub::-webkit-slider-thumb{-webkit-appearance:none;width:11px;height:11px;border-radius:50%;
+    background:var(--amber);box-shadow:0 0 12px rgba(255,170,70,.8);cursor:pointer}
+  #scrub::-moz-range-thumb{width:11px;height:11px;border:0;border-radius:50%;background:var(--amber)}
+
+  #time-label{font-variant-numeric:tabular-nums;color:#a9885c;white-space:nowrap;min-width:78px;text-align:right}
+  #fps{color:#6d5a3f;font-variant-numeric:tabular-nums;white-space:nowrap;min-width:52px;text-align:right}
+  #hint{color:#5f5138;font-size:11px;letter-spacing:.06em}
+
+  /* 加载 */
+  #loading{position:fixed;inset:0;z-index:50;background:#04020100;
+    background:radial-gradient(60% 50% at 50% 50%,#0d0703,#030201 70%);
+    display:grid;place-items:center;transition:opacity .7s ease}
+  #loading.gone{opacity:0;pointer-events:none}
+  #loading .box{text-align:center}
+  #loading .lamp{width:56px;height:56px;margin:0 auto 22px;border-radius:50%;
+    background:radial-gradient(circle,rgba(255,214,140,.95),rgba(255,150,50,.35) 55%,rgba(255,120,20,0) 72%);
+    animation:breathe 2.1s ease-in-out infinite}
+  @keyframes breathe{0%,100%{transform:scale(.86);opacity:.75}50%{transform:scale(1.06);opacity:1}}
+  #loading .t{font-size:14px;letter-spacing:.4em;color:#e0bd8a;margin-bottom:9px}
+  #loading-msg{font-size:12px;letter-spacing:.2em;color:#8a6f47}
+  #loading .err-title{font-size:15px;letter-spacing:.24em;color:#ffb45a;margin-bottom:14px}
+  #loading .err-body{font:11px/1.6 ui-monospace,Consolas,monospace;color:#f0d3a8;
+    background:rgba(255,170,80,.06);border:1px solid rgba(255,180,90,.22);border-radius:6px;
+    padding:12px 14px;max-width:min(78vw,720px);text-align:left;white-space:pre-wrap;
+    margin:0 auto 14px;overflow:auto;max-height:38vh}
+  #loading .err-hint{font-size:12px;line-height:1.9;color:#9a7f57;max-width:min(78vw,620px);margin:0 auto}
+  #loading .err-hint code{color:#ffd9a0;background:rgba(255,170,80,.10);padding:1px 5px;border-radius:3px}
+
+  @media (max-width:640px){ #hint{display:none} #perf-title{letter-spacing:.2em} }
+</style>
+</head>
+<body>
+<div id="app">
+  <div id="stage-wrap">
+    <canvas id="stage-canvas" width="1280" height="720"></canvas>
+    <div id="frame"></div>
+    <div id="subtitle"></div>
+  </div>
+
+  <div id="hud">
+    <span id="perf-title">影窗 · 夜巡</span>
+    <span id="act-name">起 · 上灯</span>
+    <div id="act-bar"></div>
+    <button id="btn-play" title="播放 / 暂停 (空格)">▶</button>
+    <input id="scrub" type="range" min="0" max="1000" value="0" step="1" aria-label="时间轴">
+    <span id="time-label">0.0s / 46s</span>
+    <span id="fps">– fps</span>
+    <span id="hint"></span>
+  </div>
+</div>
+
+<div id="loading">
+  <div class="box">
+    <div class="lamp"></div>
+    <div class="t">影 窗 · 夜 巡</div>
+    <div id="loading-msg">正在起灯…</div>
+  </div>
+</div>
+
+<!--BUNDLE-->
+<script>
+// 看门狗 + 兜底提示：任何原因导致主程序没能启动，都要让观众看到人话，而不是永远停在加载页。
+(function () {
+  var t0 = Date.now();
+  var timer = setInterval(function () {
+    if (window.__READY__ === true) { clearInterval(timer); return; }
+    if (window.__BUILD_ERROR__ || Date.now() - t0 > 12000) {
+      clearInterval(timer);
+      var box = document.getElementById('loading');
+      if (!box) return;
+      var err = window.__BUILD_ERROR__ || '(未知原因：主程序没有在 12 秒内启动)';
+      var detail = String(err).split('\n').slice(0, 6).join('\n');
+      box.innerHTML =
+        '<div class="box">' +
+        '<div class="err-title">出错了，戏没开场</div>' +
+        '<pre class="err-body"></pre>' +
+        '<div class="err-hint">可尝试：换用 Chrome / Edge 打开；或在本目录起一个本地静态服务（例如 <code>npx serve .</code>）后访问 http://localhost:3000</div>' +
+        '</div>';
+      box.querySelector('.err-body').textContent = detail;
+    }
+  }, 500);
+})();
+</script>
+</body>
+</html>

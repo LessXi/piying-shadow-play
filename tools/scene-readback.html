@@ -1,0 +1,81 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>scene readback</title>
+<style>html,body{margin:0;background:#000}</style></head>
+<body><canvas id="c" width="320" height="180"></canvas>
+<script type="importmap">{ "imports": { "three": "../vendor/three.module.js" } }</script>
+<script type="module">
+import * as THREE from 'three';
+import { makeFabricTexture, makeAlphaFromDraw } from '../src/textures.js';
+import { Stage } from '../src/stage.js';
+import { Renderer } from '../src/renderer.js';
+import { WaveScreen } from '../src/screen.js';
+import { markShadowCaster } from '../src/materials.js';
+
+const canvas = document.getElementById('c');
+const renderer = new Renderer(canvas, { width: 320, height: 180, pixelRatio: 1 });
+const R = renderer.renderer;
+const stage = new Stage({ screenWidth: 4, screenHeight: 2.5, lightFar: 12 });
+renderer.scene.add(stage.group);
+const fabric = makeFabricTexture(256);
+const screen = new WaveScreen({ width: 4, height: 2.5, segX: 40, segY: 24, fabric });
+screen.bindRenderer(renderer);
+renderer.scene.add(screen.mesh);
+screen.attachLight(stage.light, { lightFar: 12, shadowSize: 512 });
+
+const tex = makeAlphaFromDraw((ctx, w, h) => {
+  ctx.beginPath(); ctx.arc(w / 2, h / 2, w * 0.3, 0, Math.PI * 2); ctx.fill();
+}, { w: 128, h: 128, baseColor: '#1b0d06', glow: 0.5 });
+const mesh = new THREE.Mesh(new THREE.PlaneGeometry(1.05, 1.55),
+  new THREE.MeshBasicMaterial({ map: tex, transparent: true, alphaTest: 0.45, side: THREE.DoubleSide, toneMapped: false }));
+markShadowCaster(mesh, tex, { alphaTest: 0.45, lightFar: 12 });
+mesh.position.set(-0.4, -1.24, -0.15);
+renderer.scene.add(mesh);
+
+// 自建一个 8bit RT 来读回场景线性输出
+const rt = new THREE.WebGLRenderTarget(320, 180, {
+  minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter,
+  format: THREE.RGBAFormat, type: THREE.UnsignedByteType, depthBuffer: true, stencilBuffer: false,
+});
+const gl = R.getContext();
+
+function scanline(label) {
+  R.setRenderTarget(rt);
+  R.setClearColor(0x000000, 1);
+  R.clear(true, true, true);
+  R.render(renderer.scene, renderer.camera);
+  R.setRenderTarget(null);
+  const buf = new Uint8Array(320 * 180 * 4);
+  R.readRenderTargetPixels(rt, 0, 0, 320, 180, buf);
+  // 中间一行水平采样
+  const y = 90;
+  const line = [];
+  for (let x = 0; x < 320; x += 20) {
+    const i = (y * 320 + x) * 4;
+    line.push(`${x}:${buf[i]},${buf[i + 1]},${buf[i + 2]}`);
+  }
+  // 整体统计
+  let mn = 255, mx = 0, sum = 0;
+  for (let i = 0; i < buf.length; i += 4) { const v = buf[i]; mn = Math.min(mn, v); mx = Math.max(mx, v); sum += v; }
+  return { label, min: mn, max: mx, mean: +(sum / (320 * 180)).toFixed(1), line };
+}
+
+const res = {};
+screen.update(1 / 60, stage.light, renderer.camera);
+screen.renderShadow(renderer.scene);
+res.normal = scanline('normal');
+
+screen.setDebugMode(9);
+screen.update(1 / 60, stage.light, renderer.camera);
+screen.renderShadow(renderer.scene);
+res.mode9 = scanline('mode9');
+
+screen.setDebugMode(0);
+// 手动关掉阴影开关，看整幕纯受光的样子
+screen.uniforms.uShadowOn.value = 0;
+res.noShadow = scanline('noShadow');
+screen.uniforms.uShadowOn.value = 1;
+
+window.__RES__ = res;
+window.__READY__ = true;
+</script>
+</body></html>

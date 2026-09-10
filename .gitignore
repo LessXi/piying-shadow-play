@@ -1,0 +1,22 @@
+# NOTE: .gitignore 里的行内注释不是注释 —— 整行都是模式。
+# 所以注释必须单独成行，否则模式永远匹配不上（踩过一次）。
+
+# ---- 运行产物 / 生成物（都能用脚本重新生成，不入库）----
+# tools/build-single.mjs 生成；index.html 里已内联
+index.bundle.js
+*.bundle.js
+# 分享副本：tools/export-share.mjs 生成
+yingchuang-shadow-play.html
+
+# ---- 自动化测试产出的截图（145 MB，不入库）----
+# 需要看图请自己跑 tools/e2e.mjs / tools/probe.mjs / tools/verify-*.mjs 生成；
+# README 引用的 6 张精选图在 docs/images/ 下，是单独挑出来并压缩过的。
+shots/
+
+# ---- 编辑器 / 系统 ----
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+*.log
+.DS_Store

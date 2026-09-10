@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><title>props ab</title>
+<style>html,body{margin:0;background:#000}canvas{display:block}</style></head>
+<body>
+<canvas id="c" width="960" height="540"></canvas>
+<script type="importmap">{ "imports": { "three": "../vendor/three.module.js" } }</script>
+<script type="module">
+// 用真实引擎 + 真实 props.js 装配，只放布景不放演员，用于「布景可见性」A/B。
+// 皮影的布景在幕布后方、幕布不透明，所以布景可见 ⇔ 它出现在 shadow map 里。
+import * as THREE from 'three';
+import { Renderer } from '../src/renderer.js';
+import { Stage } from '../src/stage.js';
+import { WaveScreen } from '../src/screen.js';
+import { makeFabricTexture } from '../src/textures.js';
+import { buildProps } from '../src/props.js';
+
+const canvas = document.getElementById('c');
+const renderer = new Renderer(canvas, { width: 960, height: 540, pixelRatio: 1 });
+const stage = new Stage({ screenWidth: 4, screenHeight: 2.5, lightFar: 12 });
+renderer.scene.add(stage.group);
+const fabric = makeFabricTexture(1024);
+const screen = new WaveScreen({ width: 4, height: 2.5, segX: 120, segY: 80, fabric });
+screen.bindRenderer(renderer);
+renderer.scene.add(screen.mesh);
+screen.attachLight(stage.light, { lightFar: 12, shadowSize: 2048, clothDiffusion: 0.062 });
+
+const props = buildProps(renderer.scene, 12);
+stage.setLight({ intensity: 2.6, color: '#ffb45a', pos: [0.10, -0.28, -3.2] });
+
+let frames = 0;
+function frame() {
+  requestAnimationFrame(frame);
+  screen.update(1 / 60, stage.light, renderer.camera);
+  screen.renderShadow(renderer.scene);
+  renderer.render(1 / 60);
+  frames++;
+  window.__FRAMES__ = frames;
+}
+frame();
+
+window.__SET_VISIBLE__ = (key, v) => { props.rig.setPartVisible(key, v); return key; };
+
+const info = {};
+for (const p of props.rig.parts.keys()) info[p] = props.rig.parts.get(p).spec;
+window.__INFO__ = {
+  parts: Array.from(props.rig.parts.keys()),
+  sizes: Object.fromEntries(Array.from(props.rig.parts.entries()).map(([k, v]) => [k, [v.spec.w, v.spec.h, v.spec.z]])),
+  casters: (function () { let n = 0; renderer.scene.traverse(o => { if (o.isMesh && o.castShadowRaw) n++; }); return n; })(),
+};
+window.__READY__ = true;
+window.__snapshot = () => canvas.toDataURL('image/png');
+window.__qa = () => ({ frames, casters: window.__INFO__.casters });
+</script>
+</body></html>
